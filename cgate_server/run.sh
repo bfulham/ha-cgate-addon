@@ -3,13 +3,15 @@ set -euo pipefail
 
 CGATE_DIR="/data/cgate"
 SHARE_DIR="/share/cgate"
-UPLOAD_DIR="/data/packages"
-UPLOADED_PACKAGE="${UPLOAD_DIR}/cgate-package.zip"
+PACKAGE_DIR="/data/packages"
+UPLOADED_PACKAGE="${PACKAGE_DIR}/cgate-package.zip"
+PROJECT_STORE_DIR="/data/projects"
+PROJECT_METADATA_FILE="${PROJECT_STORE_DIR}/metadata.json"
 OPTIONS_FILE="/data/options.json"
 INSTALL_MARKER="${CGATE_DIR}/.installed-package"
 
 log_header() {
-    bashio::log.info "C-Gate Server app v0.1.5"
+    bashio::log.info "C-Gate Server app v0.1.6"
 }
 
 verify_zip_safe() {
@@ -54,16 +56,11 @@ select_package() {
     local requested
     requested="$(jq -r '.package_filename // ""' "${OPTIONS_FILE}")"
 
-    # A package uploaded through the ingress UI takes priority.
     if [[ -f "${UPLOADED_PACKAGE}" ]]; then
         printf '%s' "${UPLOADED_PACKAGE}"
         return 0
     fi
 
-    # Keep /share/cgate support for upgrades and manual recovery. The
-    # Supervisor share mount is intentionally read-only inside this app, so
-    # never try to create the directory here. It must already exist on the
-    # Home Assistant host if this fallback is used.
     if [[ -d "${SHARE_DIR}" ]]; then
         if [[ -n "${requested}" && -f "${SHARE_DIR}/${requested}" ]]; then
             printf '%s' "${SHARE_DIR}/${requested}"
@@ -113,6 +110,7 @@ install_cgate() {
             [[ -z "${nested_zip}" ]] && continue
             bashio::log.info "Checking nested package $(basename "${nested_zip}")"
             verify_zip_safe "${nested_zip}"
+            rm -rf "${work_dir}/nested"
             mkdir -p "${work_dir}/nested"
             unzip -q -o "${nested_zip}" -d "${work_dir}/nested"
             jar_path="$(find "${work_dir}/nested" -type f -name 'cgate.jar' -print | head -n 1 || true)"
@@ -128,12 +126,55 @@ install_cgate() {
 
     local source_dir
     source_dir="$(dirname "${jar_path}")"
-    rm -rf "${CGATE_DIR:?}"/*
+
+    # Preserve project data and generated configuration during runtime upgrades.
+    mkdir -p "${CGATE_DIR}"
+    find "${CGATE_DIR}" -mindepth 1 -maxdepth 1 \
+        ! -name 'Projects' \
+        ! -name 'config' \
+        ! -name 'logs' \
+        ! -name '.installed-package' \
+        -exec rm -rf -- {} +
     cp -a "${source_dir}/." "${CGATE_DIR}/"
     printf '%s' "${package_signature}" > "${INSTALL_MARKER}"
     chmod -R go-w "${CGATE_DIR}" 2>/dev/null || true
 
     bashio::log.info "C-Gate installed successfully"
+}
+
+sync_uploaded_projects() {
+    mkdir -p "${PROJECT_STORE_DIR}" "${CGATE_DIR}/Projects"
+
+    local project_file
+    local count=0
+    while IFS= read -r project_file; do
+        [[ -z "${project_file}" ]] && continue
+        local destination="${CGATE_DIR}/Projects/$(basename "${project_file}")"
+        # Once C-Gate/Toolkit has loaded a project, its Projects copy is the
+        # authoritative live database. Only restore the uploaded seed copy if
+        # the live file is missing, otherwise a restart could undo Toolkit edits.
+        if [[ ! -f "${destination}" ]]; then
+            cp -f "${project_file}" "${destination}"
+            count=$((count + 1))
+        fi
+    done < <(find "${PROJECT_STORE_DIR}" -maxdepth 1 -type f -name '*.xml' -print | sort)
+
+    if (( count > 0 )); then
+        bashio::log.info "Restored ${count} missing uploaded Toolkit project(s) into C-Gate"
+    fi
+}
+
+resolve_project_name() {
+    local configured
+    configured="$(jq -r '.project_name // ""' "${OPTIONS_FILE}")"
+    if [[ -n "${configured}" ]]; then
+        printf '%s' "${configured}"
+        return 0
+    fi
+
+    if [[ -f "${PROJECT_METADATA_FILE}" ]]; then
+        jq -r '.active_project // ""' "${PROJECT_METADATA_FILE}" 2>/dev/null || true
+    fi
 }
 
 write_access_file() {
@@ -175,7 +216,7 @@ ACCESS
 write_cgate_config() {
     local config_file="${CGATE_DIR}/config/C-GateConfig.txt"
     local project_name
-    project_name="$(jq -r '.project_name // ""' "${OPTIONS_FILE}")"
+    project_name="$(resolve_project_name)"
 
     mkdir -p "${CGATE_DIR}/config" "${CGATE_DIR}/Projects" "${CGATE_DIR}/logs"
     touch "${config_file}"
@@ -183,13 +224,16 @@ write_cgate_config() {
     set_config_key "${config_file}" "project.default.dir" "Projects/"
 
     if [[ -n "${project_name}" ]]; then
+        if [[ ! -f "${CGATE_DIR}/Projects/${project_name}.xml" ]]; then
+            bashio::log.warning "Default project ${project_name} is configured but ${CGATE_DIR}/Projects/${project_name}.xml does not exist"
+        fi
         set_config_key "${config_file}" "project.default" "${project_name}"
         set_config_key "${config_file}" "project.start" "${project_name}"
         bashio::log.info "Configured C-Gate to start project: ${project_name}"
     else
         remove_config_key "${config_file}" "project.default"
         remove_config_key "${config_file}" "project.start"
-        bashio::log.info "No default project configured; Toolkit can create or import one remotely"
+        bashio::log.info "No default project configured. Upload a Toolkit project through Open Web UI."
     fi
 }
 
@@ -201,11 +245,11 @@ main() {
         exit 1
     fi
 
-    mkdir -p "${CGATE_DIR}" "${UPLOAD_DIR}"
+    mkdir -p "${CGATE_DIR}" "${PACKAGE_DIR}" "${PROJECT_STORE_DIR}"
 
     python3 /upload_server.py &
     local upload_pid=$!
-    bashio::log.info "Package upload UI is available through Open Web UI"
+    bashio::log.info "Runtime and Toolkit project upload UI is available through Open Web UI"
 
     local package_file=""
     while [[ -z "${package_file}" || ! -f "${package_file}" ]]; do
@@ -215,7 +259,7 @@ main() {
             sleep 10
         fi
         if ! kill -0 "${upload_pid}" 2>/dev/null; then
-            bashio::log.error "Package upload UI stopped unexpectedly"
+            bashio::log.error "Upload UI stopped unexpectedly"
             exit 1
         fi
     done
@@ -223,6 +267,7 @@ main() {
     local force_reinstall
     force_reinstall="$(jq -r '.force_reinstall // false' "${OPTIONS_FILE}")"
     install_cgate "${package_file}" "${force_reinstall}"
+    sync_uploaded_projects
     write_access_file
     write_cgate_config
 

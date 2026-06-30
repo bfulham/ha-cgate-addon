@@ -1,38 +1,38 @@
 # Changelog
 
+## 0.1.6
+
+- Added Toolkit project upload to the authenticated ingress Web UI.
+- Accepts Toolkit `.cbz` backups and C-Gate project `.xml` files.
+- Validates the project XML, extracts the project address/name, and reports the network count.
+- Copies uploaded projects into C-Gate's persistent `Projects` directory.
+- Automatically uses the uploaded project as the default when `project_name` is blank.
+- Creates a timestamped backup before replacing an existing uploaded project.
+- Restores uploaded projects after a C-Gate runtime reinstall or upgrade.
+- Preserves C-Gate `Projects`, `config`, and `logs` directories during runtime upgrades.
+- Added project status and removal controls to the Web UI.
+
 ## 0.1.5
 
-- Expose secure ports 20123, 20124, 20125 and 20126 for Toolkit remote C-Gate connections.
-- Log all secure C-Gate ports at startup.
+- Exposed C-Gate secure ports 20124-20126 for Toolkit remote connections.
+- Added clearer Toolkit connection documentation.
 
 ## 0.1.4
 
-- Fix uploads of C-Gate packages larger than Home Assistant ingress' 16 MiB request limit.
-- Upload large ZIPs in 8 MiB chunks and assemble them in persistent app storage.
-- Add upload progress and package validation after the final chunk.
-- Stream chunks to disk instead of buffering the entire outer package in memory.
+- Added chunked uploads to avoid Home Assistant ingress request-size limits.
 
 ## 0.1.3
 
-- Fix startup failure when the Supervisor `/share` mount is read-only.
-- Stop trying to create `/share/cgate` from inside the app.
-- Keep `/share/cgate` as an optional read-only fallback when the directory already exists.
-- Continue storing Web UI uploads in the app's persistent writable `/data` directory.
+- Fixed startup when `/share` is mounted read-only.
 
 ## 0.1.2
 
-- Add an authenticated ingress Web UI for uploading the official C-Gate Linux ZIP.
-- Allow the app to start and wait for an upload when no package is present.
-- Validate ZIP safety and confirm that `cgate.jar` exists directly or in a nested ZIP.
-- Store uploaded packages privately in persistent app data.
-- Keep `/share/cgate/` as a manual fallback.
-- Change the health check to the always-available upload UI.
+- Added the authenticated ingress upload Web UI.
 
 ## 0.1.1
 
-- Accept Schneider's outer `C-Gate_3_Linux_Package_V3_7_1.zip` archive directly.
-- Detect and extract nested runtime ZIPs automatically.
+- Added support for Schneider's outer C-Gate Linux package ZIP.
 
 ## 0.1.0
 
-- Initial C-Gate-only Home Assistant app.
+- Initial release.

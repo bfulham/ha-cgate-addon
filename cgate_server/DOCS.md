@@ -1,41 +1,17 @@
 # C-Gate Server
 
-This app runs Schneider Electric C-Gate inside Home Assistant OS/Supervisor so C-Bus Toolkit and a future native Home Assistant integration can share one C-Gate server.
+This app runs Schneider Electric C-Gate inside Home Assistant OS/Supervisor so C-Bus Toolkit and a Home Assistant integration can use one C-Gate server.
 
 ## Requirements
 
 - Home Assistant OS or another Supervisor installation.
 - A current Schneider Electric C-Gate Linux package obtained from Schneider Electric or an authorised source.
-- C-Bus Toolkit 1.17 or newer when using C-Gate 3. C-Gate 3 is not compatible with Toolkit 1.16.4 and older.
-- The IP address of every Toolkit computer that is allowed to connect.
+- C-Bus Toolkit 1.17 or newer for C-Gate 3. Toolkit 1.19.4 is paired with C-Gate 3.7.1.
+- The IPv4 address of every Toolkit computer allowed to connect.
 
-## 1. Upload C-Gate
+## Configure the app
 
-Start the app, then select **Open Web UI**. Upload either:
-
-```text
-C-Gate_3_Linux_Package_V3_7_1.zip
-```
-
-or its inner runtime archive:
-
-```text
-cgate-3.7.1_2287.zip
-```
-
-The uploader verifies that the archive contains `cgate.jar`, stores it privately in the app's persistent `/data` directory, and installs it automatically. The upload page requires confirmation that you obtained the package legitimately and accept the licence included by Schneider Electric.
-
-The standard Home Assistant app Configuration tab only supports typed option fields, not file attachments. The upload control is therefore supplied through the app's authenticated ingress Web UI.
-
-Large Schneider packages exceed the 16 MiB size accepted by a single ingress request on some Home Assistant installations. The Web UI automatically splits the file into 8 MiB requests, shows upload progress, assembles it under `/data`, and validates the completed ZIP. Do not extract the outer Schneider ZIP first.
-
-### Manual fallback
-
-The previous `/share/cgate/` method is still supported. A manually copied package is used when no package has been uploaded through the Web UI. The Supervisor mounts `/share` read-only inside this app, so create the `cgate` folder and copy the ZIP using File editor, Studio Code Server, Samba, or another Home Assistant file-management tool before starting the app. The app will not try to create that folder itself.
-
-## 2. Configure the app
-
-Example configuration:
+Recommended initial configuration:
 
 ```yaml
 package_filename: C-Gate_3_Linux_Package_V3_7_1.zip
@@ -50,49 +26,107 @@ force_reinstall: false
 
 ### `toolkit_clients`
 
-Enter the exact IP address of each Windows computer running Toolkit. The app writes each address to C-Gate's `access.txt` with `Program` permission.
-
-Do not enter a subnet or CIDR range. Add each computer separately.
+Enter the exact IPv4 address of each Windows computer running Toolkit. The app writes each address to C-Gate's access file with `Program` permission.
 
 ### `integration_clients`
 
-Addresses permitted to use the C-Gate command interfaces. The default `172.30.32.1` is intended for Home Assistant's internal app network and can be changed later if the native integration connects from a different source address.
+Addresses permitted to use the C-Gate command interfaces. The default `172.30.32.1` is intended for Home Assistant's internal app network.
 
 ### `project_name`
 
-Leave blank for the first Toolkit connection test. Toolkit can then create or import the remote project. Set this later to the exact C-Gate project name to start it automatically with the app.
+Normally leave this blank. When a Toolkit project is uploaded through the Web UI, the app selects it automatically.
+
+Set this only when multiple project XML files exist and you intentionally want to override the active uploaded project. The value must match the project address and XML filename exactly, without `.xml`.
 
 ### `force_reinstall`
 
-Set to `true` once to reinstall C-Gate from the selected package. Set it back to `false` after the next successful start.
+Set to `true` for one start to reinstall the C-Gate runtime from the uploaded package, then return it to `false`. Project, configuration, and log directories are preserved.
 
-## 3. Start and verify
+## Upload the C-Gate runtime
 
-A successful startup should show the C-Gate banner and indicate that the command interfaces are listening.
+Start the app and select **Open Web UI**. Upload either:
 
-From the Toolkit computer, test the Home Assistant host address:
-
-```powershell
-Test-NetConnection HOME_ASSISTANT_IP -Port 20023
+```text
+C-Gate_3_Linux_Package_V3_7_1.zip
 ```
 
-## 4. Connect from Toolkit
+or its inner runtime archive:
 
-On the Toolkit computer whose IP is listed in `toolkit_clients`:
+```text
+cgate-3.7.1_2287.zip
+```
 
-1. Close any local C-Gate process that might already be using Toolkit.
-2. Open C-Bus Toolkit 1.17 or newer. Toolkit 1.19.4 is paired with C-Gate 3.7.1.
-3. Open **File -> Connect to a Remote C-Gate**.
-4. Enter a site name containing letters and numbers only, with no spaces.
-5. Leave Host Name blank.
-6. Enter the Home Assistant machine's LAN IP address.
-7. Confirm the connection.
+The app validates the package, including nested ZIPs, stores it privately under persistent app data, and installs it. Large files are split into 8 MiB requests to avoid Home Assistant ingress request-size limits.
 
-## 5. Import the project
+The C-Gate runtime is proprietary and is not distributed with this open-source app.
 
-Once the remote C-Gate connection works, use Toolkit to restore/import your `.cbz` backup into the remote site. This lets Toolkit perform any database migration required by C-Gate 3.
+## Upload a Toolkit project
 
-After the remote project exists, set `project_name` in the app to the exact project name and restart the app.
+In the same Web UI, use **Upload Toolkit project** and select either:
+
+- a Toolkit `.cbz` backup; or
+- a C-Gate project `.xml` file.
+
+The app will:
+
+1. Validate the archive and XML paths.
+2. Find the C-Bus `Project` element.
+3. Read the project address/name and network count.
+4. Extract the XML from a `.cbz` backup.
+5. Create a timestamped backup when replacing an existing uploaded project.
+6. Store the canonical project XML under persistent app data.
+7. Copy it into C-Gate's `Projects` directory.
+8. Select it as the active/default project when `project_name` is blank.
+
+Restart the app after uploading or replacing a project. The log should include a line similar to:
+
+```text
+Configured C-Gate to start project: THEBEND
+```
+
+If the live C-Gate project file ever needs to be restored from the uploaded seed copy, the log will also report that restoration. Normal restarts do not overwrite changes made through Toolkit.
+
+The Web UI displays the active project name, source filename, and detected network count.
+
+## Connect Toolkit
+
+On a Toolkit computer whose IP is listed in `toolkit_clients`:
+
+1. Open **File → Connect to a Remote C-Gate**.
+2. Enter a site name with no spaces.
+3. Leave **Host Name** blank for initial testing.
+4. Enter the Home Assistant machine's LAN IPv4 address.
+5. Save and connect.
+
+Test connectivity from PowerShell:
+
+```powershell
+$ha = "HOME_ASSISTANT_IP"
+20023..20026 | ForEach-Object { Test-NetConnection $ha -Port $_ }
+20123..20126 | ForEach-Object { Test-NetConnection $ha -Port $_ }
+```
+
+All eight ports should report `TcpTestSucceeded : True`.
+
+After uploading and restarting, reconnect the Toolkit remote site. The uploaded project should appear beneath the site.
+
+## Project replacement and backups
+
+Uploading a newer `.cbz` or `.xml` with the same project address replaces the active project. Before replacement, the previous XML is copied to:
+
+```text
+/data/projects/backups/
+```
+
+This directory is private persistent app data. It is not exposed through Home Assistant's `/config` or `/share` folders.
+
+Use **Remove uploaded project** in the Web UI only when you intend to remove the project from C-Gate. Restart afterward.
+
+## Manual package fallback
+
+A C-Gate runtime ZIP may still be placed in `/share/cgate/`. The `/share` mount is read-only inside the app, so create the folder and copy the file using another Home Assistant file-management tool. Web UI upload is preferred.
+
+Toolkit projects should be uploaded through the Web UI rather than copied through `/share`.
 
 ## Ports
 
@@ -102,30 +136,9 @@ After the remote project exists, set `project_name` in the app to the exact proj
 | 20024 | Event interface |
 | 20025 | Load-change interface |
 | 20026 | Configuration-change interface |
-| 20123 | Secure command interface |
+| 20123 | Secure command interface used by Toolkit |
+| 20124 | Secure event interface used by Toolkit |
+| 20125 | Secure status-change interface used by Toolkit |
+| 20126 | Secure configuration-change interface used by Toolkit |
 
-Do not expose these ports to the internet. Restrict access with your LAN firewall.
-
-## Updating C-Gate
-
-1. Open the app Web UI.
-2. Upload the newer official C-Gate ZIP.
-3. Restart the app if C-Gate is already running.
-4. Confirm the new build starts correctly.
-
-The project and configuration remain in the app's persistent `/data` directory.
-
-## Why the C-Gate runtime is not bundled
-
-The add-on code is open-source, but C-Gate is Schneider Electric proprietary software supplied under its own EULA. Publicly embedding the runtime in the GitHub repository or container image would redistribute Schneider's software to every user. The add-on instead lets each user obtain the package from Schneider, accept its licence, and upload their own copy privately.
-## Toolkit connection checks
-
-Toolkit remote repository connections use TLS ports `20123`, `20124`, `20125`, and `20126`. Test all four from the Toolkit PC:
-
-```powershell
-20123..20126 | ForEach-Object { Test-NetConnection HOME_ASSISTANT_IP -Port $_ }
-```
-
-Enter the Home Assistant LAN IPv4 address in Toolkit unless your internal DNS hostname resolves to that address. Add the Toolkit PC's IPv4 address to `toolkit_clients`, save the app configuration, and restart the app.
-
-Use C-Bus Toolkit 1.19.4 with C-Gate 3.7.1. Toolkit 1.16.4 and older are incompatible with C-Gate 3.
+Do not expose these ports to the internet.

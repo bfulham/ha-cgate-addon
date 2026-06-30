@@ -1,11 +1,12 @@
 # C-Gate Server
 
-Minimal Home Assistant app for running Schneider Electric C-Gate.
+Home Assistant app for running Schneider Electric C-Gate.
 
-- User-supplied official C-Gate package
-- Persistent installation and project database
+- User-supplied official C-Gate runtime package
+- Toolkit `.cbz` and C-Gate `.xml` project upload through the ingress Web UI
+- Persistent project database with automatic backups on replacement
 - Toolkit remote access control generated from app options
-- Standard C-Gate ports exposed to the LAN
-- No MQTT bridge or Home Assistant entities in this first release
+- Standard and secure C-Gate ports exposed to the LAN
+- No MQTT bridge or Home Assistant entities
 
 See `DOCS.md` for setup and testing instructions.

@@ -1,33 +1,27 @@
-# C-Gate Server Home Assistant app repository
+# Home Assistant C-Gate Server App
 
-This repository contains a Home Assistant app that runs Schneider Electric C-Gate inside Home Assistant OS/Supervisor.
+Runs Schneider Electric C-Gate locally on Home Assistant OS/Supervisor for C-Bus Toolkit and Home Assistant integrations.
 
-The C-Gate binary is **not redistributed**. After installing the app, start it and select **Open Web UI** to upload the official Schneider Electric Linux package. The package is stored privately in the app's persistent data directory.
-Large packages are uploaded in 8 MiB chunks so they work through Home Assistant ingress without exceeding its per-request body limit.
+## Features
 
-The older manual package path is still supported as a read-only fallback:
+- Upload the official C-Gate Linux package through the authenticated app Web UI.
+- Upload Toolkit `.cbz` backups or C-Gate project `.xml` files through the same Web UI.
+- Large files use ingress-safe 8 MiB chunked uploads.
+- Projects are validated, persisted, backed up when replaced, and copied into C-Gate's `Projects` directory.
+- An uploaded project becomes the default automatically when the app's `project_name` option is blank.
+- C-Gate project and configuration data survive runtime upgrades.
+- Toolkit client addresses are written into C-Gate's access control file.
+- Plain ports `20023-20026` and secure ports `20123-20126` are exposed.
 
-```text
-/share/cgate/
-```
+## Installation
 
-Create that folder outside the app using a Home Assistant file-management tool. Normal installations should use the Web UI uploader, which stores the package in the app's writable persistent `/data` directory.
+Add this repository to the Home Assistant App Store, install **C-Gate Server**, configure the Toolkit client IP address, then start the app.
 
-## Repository installation
+Open **Web UI** and upload:
 
-Add this URL in **Settings -> Apps -> App store -> menu -> Repositories**:
+1. The official Schneider Electric C-Gate Linux ZIP.
+2. Your Toolkit `.cbz` backup or C-Gate `.xml` project.
 
-```text
-https://github.com/bfulham/ha-cgate-addon
-```
+Restart the app after the project upload. C-Gate will start the uploaded project automatically unless `project_name` contains a manual override.
 
-Then install **C-Gate Server**, start it, and open its Web UI to upload C-Gate.
-
-See the app documentation for the complete setup and Toolkit test procedure.
-## Toolkit remote connection
-
-C-Bus Toolkit uses C-Gate's secure interface range `20123-20126`, not only the plain command port `20023`. Version 0.1.5 exposes all four secure ports.
-
-Use the Home Assistant host's LAN IPv4 address in Toolkit unless a local DNS hostname is known to resolve to that same address. The Toolkit PC must also be listed in the app's `toolkit_clients` option.
-
-C-Gate 3.7.1 is matched with C-Bus Toolkit 1.19.4. Toolkit 1.16.4 and older cannot connect to C-Gate 3.
+The proprietary C-Gate runtime is not included in this repository. Each user must obtain it from Schneider Electric or an authorised source and accept its licence.
