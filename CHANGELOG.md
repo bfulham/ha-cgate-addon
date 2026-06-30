@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+
+- Expose the complete secure C-Gate interface range `20123-20126` required by C-Bus Toolkit remote repositories.
+- Add clear secure-port startup logging.
+- Document that Toolkit must connect to the Home Assistant LAN address and must be compatible with C-Gate 3.7.1.
+
 ## 0.1.4
 
 - Fix uploads of C-Gate packages larger than Home Assistant ingress' 16 MiB request limit.

@@ -118,3 +118,14 @@ The project and configuration remain in the app's persistent `/data` directory.
 ## Why the C-Gate runtime is not bundled
 
 The add-on code is open-source, but C-Gate is Schneider Electric proprietary software supplied under its own EULA. Publicly embedding the runtime in the GitHub repository or container image would redistribute Schneider's software to every user. The add-on instead lets each user obtain the package from Schneider, accept its licence, and upload their own copy privately.
+## Toolkit connection checks
+
+Toolkit remote repository connections use TLS ports `20123`, `20124`, `20125`, and `20126`. Test all four from the Toolkit PC:
+
+```powershell
+20123..20126 | ForEach-Object { Test-NetConnection HOME_ASSISTANT_IP -Port $_ }
+```
+
+Enter the Home Assistant LAN IPv4 address in Toolkit unless your internal DNS hostname resolves to that address. Add the Toolkit PC's IPv4 address to `toolkit_clients`, save the app configuration, and restart the app.
+
+Use C-Bus Toolkit 1.19.4 with C-Gate 3.7.1. Toolkit 1.16.4 and older are incompatible with C-Gate 3.

@@ -1,5 +1,5 @@
 name: "C-Gate Server"
-version: "0.1.4"
+version: "0.1.5"
 slug: "cgate_server"
 description: "Run Schneider Electric C-Gate locally for C-Bus Toolkit and Home Assistant"
 url: "https://github.com/bfulham/ha-cgate-addon"
@@ -22,12 +22,18 @@ ports:
   "20025/tcp": 20025
   "20026/tcp": 20026
   "20123/tcp": 20123
+  "20124/tcp": 20124
+  "20125/tcp": 20125
+  "20126/tcp": 20126
 ports_description:
   "20023/tcp": "C-Gate command/program interface"
   "20024/tcp": "C-Gate event interface"
   "20025/tcp": "C-Gate load-change interface"
   "20026/tcp": "C-Gate configuration-change interface"
-  "20123/tcp": "C-Gate secure command interface"
+  "20123/tcp": "C-Gate secure command interface used by Toolkit"
+  "20124/tcp": "C-Gate secure event interface used by Toolkit"
+  "20125/tcp": "C-Gate secure status-change interface used by Toolkit"
+  "20126/tcp": "C-Gate secure configuration-change interface used by Toolkit"
 options:
   package_filename: "C-Gate_3_Linux_Package_V3_7_1.zip"
   toolkit_clients: []

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5
+
+- Expose secure ports 20123, 20124, 20125 and 20126 for Toolkit remote C-Gate connections.
+- Log all secure C-Gate ports at startup.
+
 ## 0.1.4
 
 - Fix uploads of C-Gate packages larger than Home Assistant ingress' 16 MiB request limit.

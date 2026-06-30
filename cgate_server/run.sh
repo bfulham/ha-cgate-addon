@@ -9,7 +9,7 @@ OPTIONS_FILE="/data/options.json"
 INSTALL_MARKER="${CGATE_DIR}/.installed-package"
 
 log_header() {
-    bashio::log.info "C-Gate Server app v0.1.4"
+    bashio::log.info "C-Gate Server app v0.1.5"
 }
 
 verify_zip_safe() {
@@ -235,6 +235,9 @@ main() {
     bashio::log.info "Load-change port: 20025"
     bashio::log.info "Configuration-change port: 20026"
     bashio::log.info "Secure command port: 20123"
+    bashio::log.info "Secure event port: 20124"
+    bashio::log.info "Secure status-change port: 20125"
+    bashio::log.info "Secure configuration-change port: 20126"
 
     cd "${CGATE_DIR}"
     exec java \
