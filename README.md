@@ -3,6 +3,7 @@
 This repository contains a Home Assistant app that runs Schneider Electric C-Gate inside Home Assistant OS/Supervisor.
 
 The C-Gate binary is **not redistributed**. After installing the app, start it and select **Open Web UI** to upload the official Schneider Electric Linux package. The package is stored privately in the app's persistent data directory.
+Large packages are uploaded in 8 MiB chunks so they work through Home Assistant ingress without exceeding its per-request body limit.
 
 The older manual package path is still supported as a read-only fallback:
 

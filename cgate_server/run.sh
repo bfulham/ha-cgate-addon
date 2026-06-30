@@ -9,7 +9,7 @@ OPTIONS_FILE="/data/options.json"
 INSTALL_MARKER="${CGATE_DIR}/.installed-package"
 
 log_header() {
-    bashio::log.info "C-Gate Server app v0.1.3"
+    bashio::log.info "C-Gate Server app v0.1.4"
 }
 
 verify_zip_safe() {

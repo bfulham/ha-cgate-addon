@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4
+
+- Fix uploads of C-Gate packages larger than Home Assistant ingress' 16 MiB request limit.
+- Upload large ZIPs in 8 MiB chunks and assemble them in persistent app storage.
+- Add upload progress and package validation after the final chunk.
+- Stream chunks to disk instead of buffering the entire outer package in memory.
+
 ## 0.1.3
 
 - Fix startup failure when the Supervisor `/share` mount is read-only.

@@ -27,6 +27,8 @@ The uploader verifies that the archive contains `cgate.jar`, stores it privately
 
 The standard Home Assistant app Configuration tab only supports typed option fields, not file attachments. The upload control is therefore supplied through the app's authenticated ingress Web UI.
 
+Large Schneider packages exceed the 16 MiB size accepted by a single ingress request on some Home Assistant installations. The Web UI automatically splits the file into 8 MiB requests, shows upload progress, assembles it under `/data`, and validates the completed ZIP. Do not extract the outer Schneider ZIP first.
+
 ### Manual fallback
 
 The previous `/share/cgate/` method is still supported. A manually copied package is used when no package has been uploaded through the Web UI. The Supervisor mounts `/share` read-only inside this app, so create the `cgate` folder and copy the ZIP using File editor, Studio Code Server, Samba, or another Home Assistant file-management tool before starting the app. The app will not try to create that folder itself.
