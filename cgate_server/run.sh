@@ -11,7 +11,7 @@ OPTIONS_FILE="/data/options.json"
 INSTALL_MARKER="${CGATE_DIR}/.installed-package"
 
 log_header() {
-    bashio::log.info "C-Gate Server app v0.1.6"
+    bashio::log.info "C-Gate Server app v0.1.7"
 }
 
 verify_zip_safe() {
@@ -131,6 +131,7 @@ install_cgate() {
     mkdir -p "${CGATE_DIR}"
     find "${CGATE_DIR}" -mindepth 1 -maxdepth 1 \
         ! -name 'Projects' \
+        ! -name 'tag' \
         ! -name 'config' \
         ! -name 'logs' \
         ! -name '.installed-package' \
@@ -143,24 +144,71 @@ install_cgate() {
 }
 
 sync_uploaded_projects() {
-    mkdir -p "${PROJECT_STORE_DIR}" "${CGATE_DIR}/Projects"
+    mkdir -p "${PROJECT_STORE_DIR}" "${CGATE_DIR}/tag" "${PROJECT_STORE_DIR}/backups"
 
-    local project_file
-    local count=0
-    while IFS= read -r project_file; do
-        [[ -z "${project_file}" ]] && continue
-        local destination="${CGATE_DIR}/Projects/$(basename "${project_file}")"
-        # Once C-Gate/Toolkit has loaded a project, its Projects copy is the
-        # authoritative live database. Only restore the uploaded seed copy if
-        # the live file is missing, otherwise a restart could undo Toolkit edits.
-        if [[ ! -f "${destination}" ]]; then
-            cp -f "${project_file}" "${destination}"
-            count=$((count + 1))
+    if [[ ! -f "${PROJECT_METADATA_FILE}" ]]; then
+        return 0
+    fi
+
+    local project_name
+    project_name="$(jq -r '.active_project // ""' "${PROJECT_METADATA_FILE}")"
+    if [[ -z "${project_name}" ]]; then
+        return 0
+    fi
+
+    local stored_filename
+    stored_filename="$(jq -r --arg project "${project_name}" '.projects[$project].stored_filename // ""' "${PROJECT_METADATA_FILE}")"
+
+    # Migrate metadata created by v0.1.6 when possible.
+    if [[ -z "${stored_filename}" ]]; then
+        if [[ -f "${PROJECT_STORE_DIR}/${project_name}.db" ]]; then
+            stored_filename="${project_name}.db"
+        elif [[ -f "${PROJECT_STORE_DIR}/${project_name}.xml" ]]; then
+            stored_filename="${project_name}.xml"
         fi
-    done < <(find "${PROJECT_STORE_DIR}" -maxdepth 1 -type f -name '*.xml' -print | sort)
+    fi
 
-    if (( count > 0 )); then
-        bashio::log.info "Restored ${count} missing uploaded Toolkit project(s) into C-Gate"
+    if [[ -z "${stored_filename}" || ! -f "${PROJECT_STORE_DIR}/${stored_filename}" ]]; then
+        bashio::log.warning "Uploaded project metadata exists, but the stored project file is missing"
+        return 0
+    fi
+
+    local extension="${stored_filename##*.}"
+    extension="${extension,,}"
+    if [[ "${extension}" != "db" && "${extension}" != "xml" ]]; then
+        bashio::log.error "Unsupported stored project format: ${stored_filename}"
+        return 1
+    fi
+
+    local live_dir="${CGATE_DIR}/tag/${project_name}"
+    local destination="${live_dir}/${project_name}.${extension}"
+    local pending_apply
+    pending_apply="$(jq -r --arg project "${project_name}" '.projects[$project].pending_apply // false' "${PROJECT_METADATA_FILE}")"
+
+    if [[ "${pending_apply}" == "true" || ! -f "${destination}" ]]; then
+        if [[ -d "${live_dir}" ]]; then
+            local timestamp
+            timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+            cp -a "${live_dir}" "${PROJECT_STORE_DIR}/backups/${project_name}-${timestamp}"
+            bashio::log.info "Backed up existing C-Gate project ${project_name}"
+        fi
+
+        rm -rf "${live_dir}"
+        mkdir -p "${live_dir}"
+        cp -f "${PROJECT_STORE_DIR}/${stored_filename}" "${destination}"
+
+        # Remove the incorrect legacy location used by app v0.1.6. Leaving it
+        # behind can cause C-Gate to report a failed or pending XML conversion.
+        rm -f "${CGATE_DIR}/Projects/${project_name}.xml"
+        rm -rf "${CGATE_DIR}/Projects/${project_name}"
+
+        local metadata_tmp="${PROJECT_METADATA_FILE}.tmp.$$"
+        jq --arg project "${project_name}"             '.projects[$project].pending_apply = false'             "${PROJECT_METADATA_FILE}" > "${metadata_tmp}"
+        mv "${metadata_tmp}" "${PROJECT_METADATA_FILE}"
+
+        bashio::log.info "Installed project ${project_name} as tag/${project_name}/${project_name}.${extension}"
+    else
+        bashio::log.info "Using existing live C-Gate project ${project_name}"
     fi
 }
 
@@ -218,14 +266,15 @@ write_cgate_config() {
     local project_name
     project_name="$(resolve_project_name)"
 
-    mkdir -p "${CGATE_DIR}/config" "${CGATE_DIR}/Projects" "${CGATE_DIR}/logs"
+    mkdir -p "${CGATE_DIR}/config" "${CGATE_DIR}/tag" "${CGATE_DIR}/tag/archived" "${CGATE_DIR}/logs"
     touch "${config_file}"
 
-    set_config_key "${config_file}" "project.default.dir" "Projects/"
+    set_config_key "${config_file}" "project.default.dir" "tag/"
+    set_config_key "${config_file}" "project.default.archive-dir" "tag/archived/"
 
     if [[ -n "${project_name}" ]]; then
-        if [[ ! -f "${CGATE_DIR}/Projects/${project_name}.xml" ]]; then
-            bashio::log.warning "Default project ${project_name} is configured but ${CGATE_DIR}/Projects/${project_name}.xml does not exist"
+        if [[ ! -f "${CGATE_DIR}/tag/${project_name}/${project_name}.db" && ! -f "${CGATE_DIR}/tag/${project_name}/${project_name}.xml" ]]; then
+            bashio::log.warning "Default project ${project_name} is configured but no C-Gate project database exists in tag/${project_name}/"
         fi
         set_config_key "${config_file}" "project.default" "${project_name}"
         set_config_key "${config_file}" "project.start" "${project_name}"
@@ -289,6 +338,7 @@ main() {
         -Djava.awt.headless=true \
         -Xms64m \
         -Xmx"${java_max_memory}"m \
+        --add-opens=java.xml/com.sun.org.apache.xml.internal.serialize=ALL-UNNAMED \
         -jar "${CGATE_DIR}/cgate.jar" \
         -s
 }

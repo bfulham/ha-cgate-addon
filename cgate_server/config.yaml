@@ -1,5 +1,5 @@
 name: "C-Gate Server"
-version: "0.1.6"
+version: "0.1.7"
 slug: "cgate_server"
 description: "Run Schneider Electric C-Gate locally for C-Bus Toolkit and Home Assistant"
 url: "https://github.com/bfulham/ha-cgate-addon"

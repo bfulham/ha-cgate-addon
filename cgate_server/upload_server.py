@@ -18,6 +18,7 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import tempfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -45,7 +46,8 @@ BUILD_INFO: Final = DATA_DIR / "cgate" / "BuildInfo.txt"
 
 PROJECT_METADATA_PATH: Final = PROJECT_DIR / "metadata.json"
 PROJECT_BACKUP_DIR: Final = PROJECT_DIR / "backups"
-CGATE_PROJECTS_DIR: Final = DATA_DIR / "cgate" / "Projects"
+CGATE_TAG_DIR: Final = DATA_DIR / "cgate" / "tag"
+CGATE_LEGACY_PROJECTS_DIR: Final = DATA_DIR / "cgate" / "Projects"
 
 UPLOAD_ID_RE: Final = re.compile(r"^[0-9a-f]{32}$")
 PROJECT_NAME_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -130,7 +132,8 @@ def _zip_contains_cgate_path(path: Path) -> tuple[bool, str]:
         return False, "The uploaded file is not a valid ZIP archive"
 
 
-def _project_identity(xml_path: Path) -> dict[str, object]:
+def _project_identity_xml(xml_path: Path) -> dict[str, object]:
+    """Read identity information from a legacy Toolkit XML project."""
     try:
         tree = ET.parse(xml_path)
     except (ET.ParseError, OSError) as err:
@@ -152,8 +155,10 @@ def _project_identity(xml_path: Path) -> dict[str, object]:
     for child in project:
         direct_children.setdefault(_local_name(child.tag), child)
 
-    address = (direct_children.get("Address").text or "").strip() if direct_children.get("Address") is not None else ""
-    tag_name = (direct_children.get("TagName").text or "").strip() if direct_children.get("TagName") is not None else ""
+    address_node = direct_children.get("Address")
+    tag_node = direct_children.get("TagName")
+    address = (address_node.text or "").strip() if address_node is not None else ""
+    tag_name = (tag_node.text or "").strip() if tag_node is not None else ""
     project_name = address or tag_name
     if not project_name:
         raise ValueError("The Toolkit project does not contain a project Address or TagName")
@@ -167,19 +172,91 @@ def _project_identity(xml_path: Path) -> dict[str, object]:
         "project_name": project_name,
         "tag_name": tag_name or project_name,
         "network_count": network_count,
+        "project_format": "legacy_xml",
+        "db_version": "",
     }
 
 
-def _extract_toolkit_project(upload_path: Path, original_filename: str, work_dir: Path) -> tuple[Path, dict[str, object]]:
+def _project_identity_db(db_path: Path) -> dict[str, object]:
+    """Validate and read identity information from a C-Gate 3 SQLite project."""
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as err:
+        raise ValueError(f"Invalid C-Gate project database: {err}") from err
+
+    try:
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()
+        if not quick_check or str(quick_check[0]).lower() != "ok":
+            raise ValueError(f"C-Gate project database integrity check failed: {quick_check}")
+
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        required = {"project", "tagged_entity", "network", "installation"}
+        if not required.issubset(tables):
+            missing = ", ".join(sorted(required - tables))
+            raise ValueError(f"SQLite file is not a C-Gate project database (missing: {missing})")
+
+        row = connection.execute(
+            """
+            SELECT te.address, te.tag_name, te.description
+            FROM project AS p
+            JOIN tagged_entity AS te ON te.id = p.tagged_entity_id
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            raise ValueError("The C-Gate database does not contain a project record")
+
+        address = str(row[0] or "").strip()
+        tag_name = str(row[1] or "").strip()
+        project_name = address or tag_name
+        if not project_name:
+            raise ValueError("The C-Gate database does not contain a project address or name")
+        if not PROJECT_NAME_RE.fullmatch(project_name):
+            raise ValueError(
+                "The project address must contain only letters, numbers, dot, underscore, or hyphen"
+            )
+
+        network_count = int(connection.execute("SELECT COUNT(*) FROM network").fetchone()[0])
+        version_row = connection.execute(
+            "SELECT db_version FROM installation LIMIT 1"
+        ).fetchone()
+        db_version = str(version_row[0] or "") if version_row else ""
+        return {
+            "project_name": project_name,
+            "tag_name": tag_name or project_name,
+            "network_count": network_count,
+            "project_format": "sqlite",
+            "db_version": db_version,
+            "description": str(row[2] or ""),
+        }
+    except sqlite3.DatabaseError as err:
+        raise ValueError(f"Invalid C-Gate project database: {err}") from err
+    finally:
+        connection.close()
+
+
+def _extract_toolkit_project(
+    upload_path: Path, original_filename: str, work_dir: Path
+) -> tuple[Path, dict[str, object], str]:
+    """Extract either a current SQLite or legacy XML project from an upload."""
     suffix = Path(original_filename).suffix.lower()
+    if suffix == ".db":
+        candidate = work_dir / "project.db"
+        shutil.copy2(upload_path, candidate)
+        return candidate, _project_identity_db(candidate), ".db"
+
     if suffix == ".xml":
         candidate = work_dir / "project.xml"
         shutil.copy2(upload_path, candidate)
-        identity = _project_identity(candidate)
-        return candidate, identity
+        return candidate, _project_identity_xml(candidate), ".xml"
 
     if suffix != ".cbz":
-        raise ValueError("Select a Toolkit .cbz backup or C-Gate project .xml file")
+        raise ValueError("Select a Toolkit .cbz backup, C-Gate .db project, or legacy .xml project")
 
     try:
         archive = zipfile.ZipFile(upload_path)
@@ -190,53 +267,69 @@ def _extract_toolkit_project(upload_path: Path, original_filename: str, work_dir
         infos = archive.infolist()
         if len(infos) > MAX_PROJECT_ARCHIVE_ENTRIES:
             raise ValueError("The Toolkit backup contains too many archive entries")
-        candidates: list[tuple[Path, dict[str, object]]] = []
-        for index, info in enumerate(infos):
-            if not _safe_archive_name(info.filename):
-                raise ValueError(f"Unsafe archive path: {info.filename}")
-            if info.is_dir() or not info.filename.lower().endswith(".xml"):
-                continue
-            if info.file_size <= 0 or info.file_size > MAX_PROJECT_BYTES:
-                continue
-            candidate = work_dir / f"candidate-{index}.xml"
-            with archive.open(info) as source, candidate.open("wb") as destination:
-                shutil.copyfileobj(source, destination, length=1024 * 1024)
-            try:
-                identity = _project_identity(candidate)
-            except ValueError:
-                candidate.unlink(missing_ok=True)
-                continue
-            candidates.append((candidate, identity))
+
+        candidates: list[tuple[Path, dict[str, object], str]] = []
+        # Toolkit 1.17 and later normally store the project as SQLite. Prefer
+        # that over any auxiliary XML files that may also be present.
+        for wanted_suffix, identity_reader in (
+            (".db", _project_identity_db),
+            (".xml", _project_identity_xml),
+        ):
+            for index, info in enumerate(infos):
+                if not _safe_archive_name(info.filename):
+                    raise ValueError(f"Unsafe archive path: {info.filename}")
+                if info.is_dir() or not info.filename.lower().endswith(wanted_suffix):
+                    continue
+                if info.file_size <= 0 or info.file_size > MAX_PROJECT_BYTES:
+                    continue
+                candidate = work_dir / f"candidate-{index}{wanted_suffix}"
+                with archive.open(info) as source, candidate.open("wb") as destination:
+                    shutil.copyfileobj(source, destination, length=1024 * 1024)
+                try:
+                    identity = identity_reader(candidate)
+                except ValueError:
+                    candidate.unlink(missing_ok=True)
+                    continue
+                candidates.append((candidate, identity, wanted_suffix))
+
+            if candidates:
+                break
 
         if not candidates:
-            raise ValueError("No valid C-Bus Toolkit project XML was found inside the CBZ")
+            raise ValueError(
+                "No valid C-Gate project database or legacy Toolkit project XML was found inside the CBZ"
+            )
         if len(candidates) > 1:
             names = ", ".join(str(item[1]["project_name"]) for item in candidates)
-            raise ValueError(f"The CBZ contains multiple C-Bus projects ({names}); upload one project at a time")
+            raise ValueError(
+                f"The CBZ contains multiple C-Bus projects ({names}); upload one project at a time"
+            )
         return candidates[0]
 
 
 def _store_project(upload_path: Path, original_filename: str) -> dict[str, object]:
+    """Store a validated project as a pending seed for the next app restart."""
     PROJECT_DIR.mkdir(parents=True, exist_ok=True)
     PROJECT_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    CGATE_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="cgate-project-") as temporary_dir:
-        project_xml, identity = _extract_toolkit_project(
+        project_file, identity, extension = _extract_toolkit_project(
             upload_path, original_filename, Path(temporary_dir)
         )
         project_name = str(identity["project_name"])
-        stored_path = PROJECT_DIR / f"{project_name}.xml"
-        cgate_path = CGATE_PROJECTS_DIR / f"{project_name}.xml"
+        stored_filename = f"{project_name}{extension}"
+        stored_path = PROJECT_DIR / stored_filename
 
-        backup_source = cgate_path if cgate_path.exists() else stored_path
-        if backup_source.exists():
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            backup_path = PROJECT_BACKUP_DIR / f"{project_name}-{timestamp}.xml"
-            shutil.copy2(backup_source, backup_path)
+        # Preserve any previously uploaded seed before replacing it.
+        for previous in (PROJECT_DIR / f"{project_name}.db", PROJECT_DIR / f"{project_name}.xml"):
+            if previous.exists():
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                backup_path = PROJECT_BACKUP_DIR / f"{project_name}-{timestamp}{previous.suffix}"
+                shutil.copy2(previous, backup_path)
+                if previous != stored_path:
+                    previous.unlink(missing_ok=True)
 
-        _atomic_copy(project_xml, stored_path)
-        _atomic_copy(stored_path, cgate_path)
+        _atomic_copy(project_file, stored_path)
 
     metadata = _read_json(PROJECT_METADATA_PATH)
     projects = metadata.get("projects")
@@ -246,16 +339,19 @@ def _store_project(upload_path: Path, original_filename: str) -> dict[str, objec
         "project_name": project_name,
         "tag_name": identity["tag_name"],
         "network_count": identity["network_count"],
+        "project_format": identity["project_format"],
+        "db_version": identity.get("db_version", ""),
         "source_filename": Path(original_filename).name,
+        "stored_filename": stored_filename,
         "size_bytes": stored_path.stat().st_size,
         "sha256": _sha256(stored_path),
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "pending_apply": True,
     }
     projects[project_name] = project_record
     metadata = {"active_project": project_name, "projects": projects}
     _atomic_write_json(PROJECT_METADATA_PATH, metadata)
     return project_record
-
 
 def _cgate_listening() -> bool:
     try:
@@ -302,19 +398,31 @@ def _project_status_html() -> tuple[str, str, bool]:
     active = str(metadata.get("active_project", "") or "")
     projects = metadata.get("projects")
     record = projects.get(active, {}) if active and isinstance(projects, dict) else {}
-    stored_path = PROJECT_DIR / f"{active}.xml" if active else None
+    stored_filename = str(record.get("stored_filename", "") or "") if isinstance(record, dict) else ""
+    stored_path = PROJECT_DIR / stored_filename if stored_filename else None
     exists = bool(stored_path and stored_path.is_file())
     if exists:
-        state = '<span class="pill ok">Uploaded</span>'
+        pending = bool(record.get("pending_apply", False))
+        state = (
+            '<span class="pill warn">Restart required</span>'
+            if pending
+            else '<span class="pill ok">Installed</span>'
+        )
         tag = html.escape(str(record.get("tag_name", active)))
         source = html.escape(str(record.get("source_filename", "Toolkit project")))
         networks = int(record.get("network_count", 0) or 0)
-        detail = f"{tag} / {html.escape(active)} — {networks} networks — {source}"
+        project_format = str(record.get("project_format", "unknown"))
+        format_label = "C-Gate 3 SQLite" if project_format == "sqlite" else "legacy XML"
+        db_version = str(record.get("db_version", "") or "")
+        version_text = f" DB {html.escape(db_version)}" if db_version else ""
+        detail = (
+            f"{tag} / {html.escape(active)} — {networks} networks — "
+            f"{format_label}{version_text} — {source}"
+        )
     else:
         state = '<span class="pill muted">Not uploaded</span>'
         detail = "No Toolkit project stored"
     return state, detail, exists
-
 
 def _render_page(message: str = "", error: bool = False) -> bytes:
     package_state, package_detail, package_uploaded = _package_status_html()
@@ -393,10 +501,10 @@ def _render_page(message: str = "", error: bool = False) -> bytes:
   <section class="card">
     <h2>Upload Toolkit project</h2>
     <form id="project-form">
-      <input id="project-file" type="file" accept=".cbz,.xml,application/zip,application/xml,text/xml" required>
+      <input id="project-file" type="file" accept=".cbz,.db,.xml,application/zip,application/octet-stream,application/xml,text/xml" required>
       <button id="project-button" type="submit">Upload project</button>
       <div id="project-progress-wrap" class="progress-wrap"><progress id="project-progress" max="100" value="0"></progress><span id="project-progress-text" class="small">Preparing upload…</span></div>
-      <div class="small">Accepted: Toolkit <code>.cbz</code> backup or C-Gate project <code>.xml</code>. The project is validated, backed up when replacing an existing copy, copied into C-Gate's Projects directory, and set as the default project when the app configuration's <code>project_name</code> field is blank. Restart the app after upload to load it.</div>
+      <div class="small">Accepted: Toolkit <code>.cbz</code> backup, C-Gate 3 <code>.db</code> project, or legacy <code>.xml</code> project. Current Toolkit backups contain a SQLite database and are installed into C-Gate's <code>tag/&lt;PROJECT&gt;/&lt;PROJECT&gt;.db</code> repository on restart. Legacy XML may require conversion by C-Gate.</div>
     </form>
     {project_delete}
   </section>
@@ -565,8 +673,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Select a valid ZIP file")
                 maximum = MAX_PACKAGE_BYTES
             else:
-                if Path(filename).suffix.lower() not in {".cbz", ".xml"}:
-                    raise ValueError("Select a Toolkit .cbz or project .xml file")
+                if Path(filename).suffix.lower() not in {".cbz", ".db", ".xml"}:
+                    raise ValueError("Select a Toolkit .cbz, C-Gate .db, or legacy .xml project")
                 maximum = MAX_PROJECT_BYTES
             if size <= 0 or size > maximum:
                 raise ValueError(f"Upload is empty or exceeds the {maximum // 1024 // 1024} MB limit")
@@ -646,8 +754,8 @@ class Handler(BaseHTTPRequestHandler):
                 record = _store_project(part_path, original_filename)
                 part_path.unlink(missing_ok=True)
                 message = (
-                    f"Project {record['project_name']} uploaded with {record['network_count']} networks and set as the active project. "
-                    "Restart the app so C-Gate loads it."
+                    f"Project {record['project_name']} uploaded with {record['network_count']} networks "
+                    f"as {record['project_format']}. Restart the app so C-Gate installs and loads it."
                 )
 
             state_path.unlink(missing_ok=True)
@@ -664,9 +772,15 @@ class Handler(BaseHTTPRequestHandler):
         metadata = _read_json(PROJECT_METADATA_PATH)
         active = str(metadata.get("active_project", "") or "")
         if active and PROJECT_NAME_RE.fullmatch(active):
-            (PROJECT_DIR / f"{active}.xml").unlink(missing_ok=True)
-            (CGATE_PROJECTS_DIR / f"{active}.xml").unlink(missing_ok=True)
             projects = metadata.get("projects")
+            record = projects.get(active, {}) if isinstance(projects, dict) else {}
+            stored_filename = str(record.get("stored_filename", "") or "") if isinstance(record, dict) else ""
+            if stored_filename:
+                (PROJECT_DIR / stored_filename).unlink(missing_ok=True)
+            (PROJECT_DIR / f"{active}.db").unlink(missing_ok=True)
+            (PROJECT_DIR / f"{active}.xml").unlink(missing_ok=True)
+            shutil.rmtree(CGATE_TAG_DIR / active, ignore_errors=True)
+            (CGATE_LEGACY_PROJECTS_DIR / f"{active}.xml").unlink(missing_ok=True)
             if isinstance(projects, dict):
                 projects.pop(active, None)
                 remaining = sorted(projects)

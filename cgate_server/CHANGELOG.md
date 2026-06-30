@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.7
+
+- Added Toolkit 1.17+ CBZ support for backups containing SQLite `.db` project databases.
+- Added direct C-Gate `.db` upload support.
+- Fixed the C-Gate 3 repository path and layout to `tag/<PROJECT>/<PROJECT>.db`.
+- Validates SQLite database integrity and required C-Gate project tables before installation.
+- Reads project name, tag name, DB version, description, and network count from the database.
+- Removes the incorrect v0.1.6 `Projects/<PROJECT>.xml` copy when a replacement is applied.
+- Preserves C-Gate's live `tag` repository during runtime package upgrades.
+- Keeps legacy XML upload support for projects that C-Gate can convert.
+
 ## 0.1.6
 
 - Added Toolkit project upload to the authenticated ingress Web UI.

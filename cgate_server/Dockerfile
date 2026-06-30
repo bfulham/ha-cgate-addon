@@ -5,6 +5,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apk add --no-cache \
     openjdk17-jre-headless \
     python3 \
+    sqlite-libs \
     unzip \
     jq \
     netcat-openbsd \
