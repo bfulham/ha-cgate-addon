@@ -1,0 +1,47 @@
+name: "C-Gate Server"
+version: "0.1.2"
+slug: "cgate_server"
+description: "Run Schneider Electric C-Gate locally for C-Bus Toolkit and Home Assistant"
+url: "https://github.com/bfulham/ha-cgate-addon"
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+init: false
+ingress: true
+ingress_port: 8099
+ingress_entry: "/"
+panel_icon: "mdi:lan-connect"
+map:
+  - type: share
+    read_only: true
+ports:
+  "20023/tcp": 20023
+  "20024/tcp": 20024
+  "20025/tcp": 20025
+  "20026/tcp": 20026
+  "20123/tcp": 20123
+ports_description:
+  "20023/tcp": "C-Gate command/program interface"
+  "20024/tcp": "C-Gate event interface"
+  "20025/tcp": "C-Gate load-change interface"
+  "20026/tcp": "C-Gate configuration-change interface"
+  "20123/tcp": "C-Gate secure command interface"
+options:
+  package_filename: "C-Gate_3_Linux_Package_V3_7_1.zip"
+  toolkit_clients: []
+  integration_clients:
+    - "172.30.32.1"
+  project_name: ""
+  java_max_memory_mb: 512
+  force_reinstall: false
+schema:
+  package_filename: str
+  toolkit_clients:
+    - str
+  integration_clients:
+    - str
+  project_name: str
+  java_max_memory_mb: int(128,2048)
+  force_reinstall: bool
