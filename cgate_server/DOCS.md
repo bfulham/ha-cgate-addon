@@ -29,7 +29,7 @@ The standard Home Assistant app Configuration tab only supports typed option fie
 
 ### Manual fallback
 
-The previous `/share/cgate/` method is still supported. A manually copied package is used when no package has been uploaded through the Web UI.
+The previous `/share/cgate/` method is still supported. A manually copied package is used when no package has been uploaded through the Web UI. The Supervisor mounts `/share` read-only inside this app, so create the `cgate` folder and copy the ZIP using File editor, Studio Code Server, Samba, or another Home Assistant file-management tool before starting the app. The app will not try to create that folder itself.
 
 ## 2. Configure the app
 

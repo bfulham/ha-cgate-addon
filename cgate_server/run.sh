@@ -9,7 +9,7 @@ OPTIONS_FILE="/data/options.json"
 INSTALL_MARKER="${CGATE_DIR}/.installed-package"
 
 log_header() {
-    bashio::log.info "C-Gate Server app v0.1.2"
+    bashio::log.info "C-Gate Server app v0.1.3"
 }
 
 verify_zip_safe() {
@@ -60,16 +60,24 @@ select_package() {
         return 0
     fi
 
-    # Keep /share/cgate support for upgrades and manual recovery.
-    if [[ -n "${requested}" && -f "${SHARE_DIR}/${requested}" ]]; then
-        printf '%s' "${SHARE_DIR}/${requested}"
+    # Keep /share/cgate support for upgrades and manual recovery. The
+    # Supervisor share mount is intentionally read-only inside this app, so
+    # never try to create the directory here. It must already exist on the
+    # Home Assistant host if this fallback is used.
+    if [[ -d "${SHARE_DIR}" ]]; then
+        if [[ -n "${requested}" && -f "${SHARE_DIR}/${requested}" ]]; then
+            printf '%s' "${SHARE_DIR}/${requested}"
+            return 0
+        fi
+
+        find "${SHARE_DIR}" -maxdepth 1 -type f -iname '*.zip' -print 2>/dev/null \
+            | grep -Ei '/[^/]*c-?gate[^/]*\.zip$' \
+            | sort \
+            | tail -n 1
         return 0
     fi
 
-    find "${SHARE_DIR}" -maxdepth 1 -type f -iname '*.zip' -print 2>/dev/null \
-        | grep -Ei '/[^/]*c-?gate[^/]*\.zip$' \
-        | sort \
-        | tail -n 1
+    return 1
 }
 
 install_cgate() {
@@ -193,7 +201,7 @@ main() {
         exit 1
     fi
 
-    mkdir -p "${SHARE_DIR}" "${CGATE_DIR}" "${UPLOAD_DIR}"
+    mkdir -p "${CGATE_DIR}" "${UPLOAD_DIR}"
 
     python3 /upload_server.py &
     local upload_pid=$!

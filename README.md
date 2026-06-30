@@ -4,11 +4,13 @@ This repository contains a Home Assistant app that runs Schneider Electric C-Gat
 
 The C-Gate binary is **not redistributed**. After installing the app, start it and select **Open Web UI** to upload the official Schneider Electric Linux package. The package is stored privately in the app's persistent data directory.
 
-The older manual package path is still supported as a fallback:
+The older manual package path is still supported as a read-only fallback:
 
 ```text
 /share/cgate/
 ```
+
+Create that folder outside the app using a Home Assistant file-management tool. Normal installations should use the Web UI uploader, which stores the package in the app's writable persistent `/data` directory.
 
 ## Repository installation
 
