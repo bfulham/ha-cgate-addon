@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Ingress Web UI for C-Gate runtime and Toolkit project uploads.
-
-Home Assistant ingress may reject individual request bodies larger than 16 MiB.
-The browser therefore sends files in small raw chunks. The app assembles them
-under /data, validates them, and stores them persistently.
-"""
+"""Ingress Web UI for managing the C-Gate runtime and Toolkit project."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import html
@@ -22,7 +18,7 @@ import sqlite3
 import tempfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Final
+from typing import Final, Iterator
 from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 import zipfile
@@ -38,12 +34,10 @@ DATA_DIR: Final = Path("/data")
 PACKAGE_DIR: Final = DATA_DIR / "packages"
 PROJECT_DIR: Final = DATA_DIR / "projects"
 UPLOAD_DIR: Final = DATA_DIR / "uploads"
-
 PACKAGE_PATH: Final = PACKAGE_DIR / "cgate-package.zip"
 PACKAGE_METADATA_PATH: Final = PACKAGE_DIR / "metadata.json"
 INSTALL_MARKER: Final = DATA_DIR / "cgate" / ".installed-package"
 BUILD_INFO: Final = DATA_DIR / "cgate" / "BuildInfo.txt"
-
 PROJECT_METADATA_PATH: Final = PROJECT_DIR / "metadata.json"
 PROJECT_BACKUP_DIR: Final = PROJECT_DIR / "backups"
 CGATE_TAG_DIR: Final = DATA_DIR / "cgate" / "tag"
@@ -51,11 +45,15 @@ CGATE_LEGACY_PROJECTS_DIR: Final = DATA_DIR / "cgate" / "Projects"
 
 UPLOAD_ID_RE: Final = re.compile(r"^[0-9a-f]{32}$")
 PROJECT_NAME_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+REQUIRED_CGATE_TABLES: Final = {"installation", "network", "project", "tagged_entity"}
+
+
+class ProjectBackupError(RuntimeError):
+    """Raised when a current project backup cannot be created."""
 
 
 def _safe_archive_name(name: str) -> bool:
-    normalized = name.replace("\\", "/")
-    path = PurePosixPath(normalized)
+    path = PurePosixPath(name.replace("\\", "/"))
     return not path.is_absolute() and ".." not in path.parts
 
 
@@ -93,20 +91,25 @@ def _atomic_copy(source: Path, destination: Path) -> None:
     os.replace(temporary, destination)
 
 
-def _check_zip_archive(archive: zipfile.ZipFile, *, nested: bool = True) -> tuple[bool, str]:
+def _check_zip_archive(
+    archive: zipfile.ZipFile, *, nested: bool = True
+) -> tuple[bool, str]:
     infos = archive.infolist()
     for info in infos:
         if not _safe_archive_name(info.filename):
             return False, f"Unsafe archive path: {info.filename}"
 
-    if any(PurePosixPath(i.filename.replace("\\", "/")).name == "cgate.jar" for i in infos):
+    if any(
+        PurePosixPath(info.filename.replace("\\", "/")).name == "cgate.jar"
+        for info in infos
+    ):
         return True, "C-Gate runtime found"
 
     if nested:
         for info in infos:
-            if not info.filename.lower().endswith(".zip") or info.is_dir():
+            if info.is_dir() or not info.filename.lower().endswith(".zip"):
                 continue
-            if info.file_size > MAX_PACKAGE_BYTES:
+            if info.file_size <= 0 or info.file_size > MAX_PACKAGE_BYTES:
                 continue
             try:
                 with archive.open(info) as source, tempfile.SpooledTemporaryFile(
@@ -116,8 +119,9 @@ def _check_zip_archive(archive: zipfile.ZipFile, *, nested: bool = True) -> tupl
                     nested_file.seek(0)
                     with zipfile.ZipFile(nested_file) as nested_archive:
                         found, _ = _check_zip_archive(nested_archive, nested=False)
-                    if found:
-                        return True, f"C-Gate runtime found in {PurePosixPath(info.filename).name}"
+                        if found:
+                            name = PurePosixPath(info.filename).name
+                            return True, f"C-Gate runtime found in {name}"
             except (RuntimeError, OSError, zipfile.BadZipFile):
                 continue
 
@@ -133,7 +137,6 @@ def _zip_contains_cgate_path(path: Path) -> tuple[bool, str]:
 
 
 def _project_identity_xml(xml_path: Path) -> dict[str, object]:
-    """Read identity information from a legacy Toolkit XML project."""
     try:
         tree = ET.parse(xml_path)
     except (ET.ParseError, OSError) as err:
@@ -144,7 +147,9 @@ def _project_identity_xml(xml_path: Path) -> dict[str, object]:
     if root_name == "Project":
         project = root
     elif root_name == "Installation":
-        project = next((child for child in root if _local_name(child.tag) == "Project"), None)
+        project = next(
+            (child for child in root if _local_name(child.tag) == "Project"), None
+        )
     else:
         project = None
 
@@ -160,6 +165,7 @@ def _project_identity_xml(xml_path: Path) -> dict[str, object]:
     address = (address_node.text or "").strip() if address_node is not None else ""
     tag_name = (tag_node.text or "").strip() if tag_node is not None else ""
     project_name = address or tag_name
+
     if not project_name:
         raise ValueError("The Toolkit project does not contain a project Address or TagName")
     if not PROJECT_NAME_RE.fullmatch(project_name):
@@ -178,7 +184,6 @@ def _project_identity_xml(xml_path: Path) -> dict[str, object]:
 
 
 def _project_identity_db(db_path: Path) -> dict[str, object]:
-    """Validate and read identity information from a C-Gate 3 SQLite project."""
     try:
         connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error as err:
@@ -187,7 +192,9 @@ def _project_identity_db(db_path: Path) -> dict[str, object]:
     try:
         quick_check = connection.execute("PRAGMA quick_check").fetchone()
         if not quick_check or str(quick_check[0]).lower() != "ok":
-            raise ValueError(f"C-Gate project database integrity check failed: {quick_check}")
+            raise ValueError(
+                f"C-Gate project database integrity check failed: {quick_check}"
+            )
 
         tables = {
             str(row[0])
@@ -195,10 +202,13 @@ def _project_identity_db(db_path: Path) -> dict[str, object]:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        required = {"project", "tagged_entity", "network", "installation"}
-        if not required.issubset(tables):
-            missing = ", ".join(sorted(required - tables))
-            raise ValueError(f"SQLite file is not a C-Gate project database (missing: {missing})")
+        missing = REQUIRED_CGATE_TABLES - tables
+        if missing:
+            raise ValueError(
+                "SQLite file is not a C-Gate project database (missing: "
+                + ", ".join(sorted(missing))
+                + ")"
+            )
 
         row = connection.execute(
             """
@@ -221,11 +231,14 @@ def _project_identity_db(db_path: Path) -> dict[str, object]:
                 "The project address must contain only letters, numbers, dot, underscore, or hyphen"
             )
 
-        network_count = int(connection.execute("SELECT COUNT(*) FROM network").fetchone()[0])
+        network_count = int(
+            connection.execute("SELECT COUNT(*) FROM network").fetchone()[0]
+        )
         version_row = connection.execute(
             "SELECT db_version FROM installation LIMIT 1"
         ).fetchone()
         db_version = str(version_row[0] or "") if version_row else ""
+
         return {
             "project_name": project_name,
             "tag_name": tag_name or project_name,
@@ -243,8 +256,8 @@ def _project_identity_db(db_path: Path) -> dict[str, object]:
 def _extract_toolkit_project(
     upload_path: Path, original_filename: str, work_dir: Path
 ) -> tuple[Path, dict[str, object], str]:
-    """Extract either a current SQLite or legacy XML project from an upload."""
     suffix = Path(original_filename).suffix.lower()
+
     if suffix == ".db":
         candidate = work_dir / "project.db"
         shutil.copy2(upload_path, candidate)
@@ -256,7 +269,9 @@ def _extract_toolkit_project(
         return candidate, _project_identity_xml(candidate), ".xml"
 
     if suffix != ".cbz":
-        raise ValueError("Select a Toolkit .cbz backup, C-Gate .db project, or legacy .xml project")
+        raise ValueError(
+            "Select a Toolkit .cbz backup, C-Gate .db project, or legacy .xml project"
+        )
 
     try:
         archive = zipfile.ZipFile(upload_path)
@@ -269,8 +284,6 @@ def _extract_toolkit_project(
             raise ValueError("The Toolkit backup contains too many archive entries")
 
         candidates: list[tuple[Path, dict[str, object], str]] = []
-        # Toolkit 1.17 and later normally store the project as SQLite. Prefer
-        # that over any auxiliary XML files that may also be present.
         for wanted_suffix, identity_reader in (
             (".db", _project_identity_db),
             (".xml", _project_identity_xml),
@@ -282,9 +295,11 @@ def _extract_toolkit_project(
                     continue
                 if info.file_size <= 0 or info.file_size > MAX_PROJECT_BYTES:
                     continue
+
                 candidate = work_dir / f"candidate-{index}{wanted_suffix}"
                 with archive.open(info) as source, candidate.open("wb") as destination:
                     shutil.copyfileobj(source, destination, length=1024 * 1024)
+
                 try:
                     identity = identity_reader(candidate)
                 except ValueError:
@@ -308,7 +323,6 @@ def _extract_toolkit_project(
 
 
 def _store_project(upload_path: Path, original_filename: str) -> dict[str, object]:
-    """Store a validated project as a pending seed for the next app restart."""
     PROJECT_DIR.mkdir(parents=True, exist_ok=True)
     PROJECT_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -320,11 +334,15 @@ def _store_project(upload_path: Path, original_filename: str) -> dict[str, objec
         stored_filename = f"{project_name}{extension}"
         stored_path = PROJECT_DIR / stored_filename
 
-        # Preserve any previously uploaded seed before replacing it.
-        for previous in (PROJECT_DIR / f"{project_name}.db", PROJECT_DIR / f"{project_name}.xml"):
+        for previous in (
+            PROJECT_DIR / f"{project_name}.db",
+            PROJECT_DIR / f"{project_name}.xml",
+        ):
             if previous.exists():
                 timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                backup_path = PROJECT_BACKUP_DIR / f"{project_name}-{timestamp}{previous.suffix}"
+                backup_path = (
+                    PROJECT_BACKUP_DIR / f"{project_name}-{timestamp}{previous.suffix}"
+                )
                 shutil.copy2(previous, backup_path)
                 if previous != stored_path:
                     previous.unlink(missing_ok=True)
@@ -335,6 +353,7 @@ def _store_project(upload_path: Path, original_filename: str) -> dict[str, objec
     projects = metadata.get("projects")
     if not isinstance(projects, dict):
         projects = {}
+
     project_record: dict[str, object] = {
         "project_name": project_name,
         "tag_name": identity["tag_name"],
@@ -349,9 +368,132 @@ def _store_project(upload_path: Path, original_filename: str) -> dict[str, objec
         "pending_apply": True,
     }
     projects[project_name] = project_record
-    metadata = {"active_project": project_name, "projects": projects}
-    _atomic_write_json(PROJECT_METADATA_PATH, metadata)
+    _atomic_write_json(
+        PROJECT_METADATA_PATH,
+        {"active_project": project_name, "projects": projects},
+    )
     return project_record
+
+
+def _single_live_project() -> str:
+    try:
+        candidates = [
+            child.name
+            for child in CGATE_TAG_DIR.iterdir()
+            if child.is_dir()
+            and PROJECT_NAME_RE.fullmatch(child.name)
+            and (child / f"{child.name}.db").is_file()
+        ]
+    except OSError:
+        return ""
+    return candidates[0] if len(candidates) == 1 else ""
+
+
+def _resolve_backup_source() -> tuple[str, Path]:
+    metadata = _read_json(PROJECT_METADATA_PATH)
+    active = str(metadata.get("active_project", "") or "")
+    projects = metadata.get("projects")
+    record = projects.get(active, {}) if active and isinstance(projects, dict) else {}
+
+    if not PROJECT_NAME_RE.fullmatch(active):
+        active = _single_live_project()
+        record = {}
+
+    if not active:
+        raise ProjectBackupError(
+            "No active C-Gate project was found. Upload or select a project first."
+        )
+
+    candidates: list[Path] = [CGATE_TAG_DIR / active / f"{active}.db"]
+    if isinstance(record, dict):
+        stored_filename = str(record.get("stored_filename", "") or "")
+        if stored_filename and Path(stored_filename).name == stored_filename:
+            candidates.append(PROJECT_DIR / stored_filename)
+    candidates.extend((PROJECT_DIR / f"{active}.db", PROJECT_DIR / f"{active}.xml"))
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return active, candidate
+        except OSError:
+            continue
+
+    raise ProjectBackupError(
+        f"The active project {active} has no readable live or stored project file."
+    )
+
+
+def _snapshot_sqlite(source_path: Path, destination_path: Path) -> None:
+    try:
+        with sqlite3.connect(
+            f"file:{source_path}?mode=ro", uri=True, timeout=15
+        ) as source, sqlite3.connect(destination_path, timeout=15) as destination:
+            source.backup(destination)
+            quick_check = destination.execute("PRAGMA quick_check").fetchone()
+            if not quick_check or str(quick_check[0]).lower() != "ok":
+                raise ProjectBackupError(
+                    f"The generated SQLite snapshot failed its integrity check: {quick_check}"
+                )
+            tables = {
+                str(row[0])
+                for row in destination.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            missing = REQUIRED_CGATE_TABLES - tables
+            if missing:
+                raise ProjectBackupError(
+                    "The live database is missing required C-Gate tables: "
+                    + ", ".join(sorted(missing))
+                )
+    except ProjectBackupError:
+        raise
+    except sqlite3.Error as err:
+        raise ProjectBackupError(
+            f"Unable to snapshot the live C-Gate database: {err}"
+        ) from err
+
+
+@contextmanager
+def _create_project_backup() -> Iterator[tuple[Path, str]]:
+    project_name, source_path = _resolve_backup_source()
+    suffix = source_path.suffix.lower()
+    if suffix not in {".db", ".xml"}:
+        raise ProjectBackupError(
+            f"Unsupported active project format: {suffix or 'unknown'}"
+        )
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"{project_name}_{timestamp}_CGATE.cbz"
+
+    with tempfile.TemporaryDirectory(prefix="cgate-download-") as temporary_dir:
+        temporary_path = Path(temporary_dir)
+        snapshot_path = temporary_path / f"{project_name}{suffix}"
+        archive_path = temporary_path / filename
+
+        if suffix == ".db":
+            _snapshot_sqlite(source_path, snapshot_path)
+        else:
+            try:
+                shutil.copy2(source_path, snapshot_path)
+            except OSError as err:
+                raise ProjectBackupError(
+                    f"Unable to copy the active XML project: {err}"
+                ) from err
+
+        try:
+            with zipfile.ZipFile(
+                archive_path,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6,
+            ) as archive:
+                archive.write(snapshot_path, arcname=snapshot_path.name)
+        except (OSError, zipfile.BadZipFile) as err:
+            raise ProjectBackupError(f"Unable to create the CBZ backup: {err}") from err
+
+        yield archive_path, filename
+
 
 def _cgate_listening() -> bool:
     try:
@@ -379,17 +521,21 @@ def _package_status_html() -> tuple[str, str, bool]:
         installed_hash = ""
 
     if uploaded and current_hash == installed_hash:
-        state = '<span class="pill ok">Installed</span>'
+        state = "Installed"
     elif uploaded and installed_hash:
-        state = '<span class="pill warn">Restart app to apply</span>'
+        state = "Restart app to apply"
     elif uploaded:
-        state = '<span class="pill warn">Ready to install</span>'
+        state = "Ready to install"
     else:
-        state = '<span class="pill muted">Not uploaded</span>'
+        state = "Not uploaded"
 
     filename = html.escape(str(metadata.get("original_filename", "C-Gate package")))
     size = int(metadata.get("size_bytes", 0) or 0)
-    detail = f"{filename} ({size / 1024 / 1024:.1f} MB)" if uploaded and size else "No package stored"
+    detail = (
+        f"{filename} ({size / 1024 / 1024:.1f} MB)"
+        if uploaded and size
+        else "No package stored"
+    )
     return state, detail, uploaded
 
 
@@ -398,42 +544,58 @@ def _project_status_html() -> tuple[str, str, bool]:
     active = str(metadata.get("active_project", "") or "")
     projects = metadata.get("projects")
     record = projects.get(active, {}) if active and isinstance(projects, dict) else {}
-    stored_filename = str(record.get("stored_filename", "") or "") if isinstance(record, dict) else ""
+
+    stored_filename = (
+        str(record.get("stored_filename", "") or "") if isinstance(record, dict) else ""
+    )
     stored_path = PROJECT_DIR / stored_filename if stored_filename else None
-    exists = bool(stored_path and stored_path.is_file())
-    if exists:
-        pending = bool(record.get("pending_apply", False))
-        state = (
-            '<span class="pill warn">Restart required</span>'
-            if pending
-            else '<span class="pill ok">Installed</span>'
+    stored_exists = bool(stored_path and stored_path.is_file())
+    live_exists = bool(
+        active
+        and PROJECT_NAME_RE.fullmatch(active)
+        and (CGATE_TAG_DIR / active / f"{active}.db").is_file()
+    )
+
+    if stored_exists or live_exists:
+        pending = bool(record.get("pending_apply", False)) if isinstance(record, dict) else False
+        state = "Restart required" if pending else "Installed"
+        tag = html.escape(str(record.get("tag_name", active)) if isinstance(record, dict) else active)
+        source = html.escape(
+            str(record.get("source_filename", "Live C-Gate project"))
+            if isinstance(record, dict)
+            else "Live C-Gate project"
         )
-        tag = html.escape(str(record.get("tag_name", active)))
-        source = html.escape(str(record.get("source_filename", "Toolkit project")))
-        networks = int(record.get("network_count", 0) or 0)
-        project_format = str(record.get("project_format", "unknown"))
+        networks = int(record.get("network_count", 0) or 0) if isinstance(record, dict) else 0
+        project_format = (
+            str(record.get("project_format", "sqlite")) if isinstance(record, dict) else "sqlite"
+        )
         format_label = "C-Gate 3 SQLite" if project_format == "sqlite" else "legacy XML"
-        db_version = str(record.get("db_version", "") or "")
+        db_version = str(record.get("db_version", "") or "") if isinstance(record, dict) else ""
         version_text = f" DB {html.escape(db_version)}" if db_version else ""
+        network_text = f" — {networks} networks" if networks else ""
         detail = (
-            f"{tag} / {html.escape(active)} — {networks} networks — "
+            f"{tag} / {html.escape(active)}{network_text} — "
             f"{format_label}{version_text} — {source}"
         )
-    else:
-        state = '<span class="pill muted">Not uploaded</span>'
-        detail = "No Toolkit project stored"
-    return state, detail, exists
+        return state, detail, True
+
+    live_project = _single_live_project()
+    if live_project:
+        return "Installed", f"{html.escape(live_project)} — live C-Gate SQLite project", True
+
+    return "Not uploaded", "No Toolkit project stored", False
+
 
 def _render_page(message: str = "", error: bool = False) -> bytes:
     package_state, package_detail, package_uploaded = _package_status_html()
-    project_state, project_detail, project_uploaded = _project_status_html()
+    project_state, project_detail, project_available = _project_status_html()
 
     if _cgate_listening():
-        runtime_state = '<span class="pill ok">Running</span>'
+        runtime_state = "Running"
     elif INSTALL_MARKER.exists():
-        runtime_state = '<span class="pill warn">Installed, not listening</span>'
+        runtime_state = "Installed, not listening"
     else:
-        runtime_state = '<span class="pill muted">Waiting for package</span>'
+        runtime_state = "Waiting for package"
 
     build = html.escape(_build_info())
     notice = ""
@@ -441,151 +603,187 @@ def _render_page(message: str = "", error: bool = False) -> bytes:
         css_class = "notice error" if error else "notice success"
         notice = f'<div class="{css_class}">{html.escape(message)}</div>'
 
-    package_delete = ""
+    project_actions = ""
+    if project_available:
+        project_actions = """
+        <div class="actions">
+          <a class="button secondary" href="./project/backup">Download current backup</a>
+          <form method="post" action="./project/delete">
+            <button class="danger" type="submit">Remove uploaded project</button>
+          </form>
+        </div>"""
+
+    package_actions = ""
     if package_uploaded:
-        package_delete = """
-        <form method="post" action="./package/delete" onsubmit="return confirm('Delete the stored C-Gate package ZIP? The installed runtime will remain.');">
-          <button class="danger secondary" type="submit">Delete stored package ZIP</button>
+        package_actions = """
+        <form method="post" action="./package/delete">
+          <button class="danger" type="submit">Delete stored package ZIP</button>
         </form>"""
 
-    project_delete = ""
-    if project_uploaded:
-        project_delete = """
-        <form method="post" action="./project/delete" onsubmit="return confirm('Remove the uploaded Toolkit project from this app and C-Gate?');">
-          <button class="danger secondary" type="submit">Remove uploaded project</button>
-        </form>"""
+    build_row = f"<dt>Build</dt><dd>{build}</dd>" if build else ""
 
     page = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>C-Gate Server</title>
   <style>
-    :root {{ color-scheme: light dark; --accent:#03a9f4; --card:#fff; --text:#202124; --muted:#6b7280; --border:#d1d5db; }}
-    @media (prefers-color-scheme: dark) {{ :root {{ --card:#1f2937; --text:#f3f4f6; --muted:#9ca3af; --border:#4b5563; }} }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--text); background:transparent; }}
-    main {{ max-width:800px; margin:0 auto; padding:24px 16px 48px; }}
-    h1 {{ margin:0 0 6px; font-size:28px; }} h2 {{ margin:0 0 12px; font-size:19px; }}
-    .sub,.small {{ color:var(--muted); }} .sub {{ margin-bottom:20px; }}
-    .card {{ background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin:14px 0; box-shadow:0 1px 2px rgba(0,0,0,.08); }}
-    .row {{ display:flex; justify-content:space-between; gap:18px; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); }}
-    .row:last-child {{ border-bottom:0; }} .label {{ color:var(--muted); }}
-    .pill {{ display:inline-block; padding:3px 9px; border-radius:999px; font-size:12px; font-weight:600; }}
-    .ok {{ background:#dcfce7; color:#166534; }} .warn {{ background:#fef3c7; color:#92400e; }} .muted {{ background:#e5e7eb; color:#374151; }}
-    form {{ display:grid; gap:14px; margin:0; }} input[type=file] {{ width:100%; border:1px dashed var(--border); border-radius:8px; padding:14px; }}
-    label.check {{ display:flex; gap:10px; align-items:flex-start; }}
-    button {{ border:0; border-radius:8px; padding:11px 16px; background:var(--accent); color:white; font-weight:600; cursor:pointer; width:max-content; }}
-    button:disabled {{ opacity:.55; cursor:wait; }} button.danger {{ background:#b91c1c; }} button.secondary {{ margin-top:14px; }}
-    .notice {{ padding:12px 14px; border-radius:8px; margin:14px 0; }} .success {{ background:#dcfce7; color:#166534; }} .error {{ background:#fee2e2; color:#991b1b; }}
-    .progress-wrap {{ display:none; gap:8px; }} .progress-wrap.active {{ display:grid; }} progress {{ width:100%; height:18px; }}
-    code {{ overflow-wrap:anywhere; }}
+    :root {{ color-scheme: light dark; font-family: system-ui, sans-serif; }}
+    body {{ margin: 0; background: #101418; color: #e8edf2; }}
+    main {{ max-width: 880px; margin: 0 auto; padding: 24px 18px 48px; }}
+    h1 {{ margin: 0 0 8px; }}
+    h2 {{ margin-top: 0; }}
+    .lead {{ color: #b9c3cd; margin-bottom: 22px; }}
+    .card {{ background: #1a2026; border: 1px solid #323b44; border-radius: 12px; padding: 20px; margin: 16px 0; }}
+    dl {{ display: grid; grid-template-columns: minmax(150px, 220px) 1fr; gap: 8px 16px; margin: 0; }}
+    dt {{ color: #9eabb7; }} dd {{ margin: 0; overflow-wrap: anywhere; }}
+    label {{ display: block; margin: 12px 0 6px; }}
+    input[type=file] {{ display: block; width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #47525d; border-radius: 7px; background: #11161b; color: inherit; }}
+    .check {{ display: flex; align-items: flex-start; gap: 8px; }}
+    .check input {{ margin-top: 4px; }}
+    button, .button {{ display: inline-block; border: 0; border-radius: 7px; padding: 10px 15px; font-weight: 650; cursor: pointer; text-decoration: none; background: #03a9f4; color: #001018; }}
+    button:disabled {{ opacity: .55; cursor: not-allowed; }}
+    .secondary {{ background: #d9e2ea; color: #111820; }}
+    .danger {{ background: #df6671; color: #180306; }}
+    .actions {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }}
+    .actions form {{ margin: 0; }}
+    .notice {{ border-radius: 8px; padding: 12px 14px; margin: 16px 0; }}
+    .success {{ background: #173c2b; border: 1px solid #2e8059; }}
+    .error {{ background: #482229; border: 1px solid #a54e5b; }}
+    .hint {{ color: #aeb9c4; font-size: .93rem; line-height: 1.45; }}
+    .progress {{ min-height: 1.4em; margin: 10px 0; color: #a9dfff; }}
+    code {{ background: #0d1115; border-radius: 4px; padding: 1px 5px; }}
+    @media (max-width: 620px) {{ dl {{ grid-template-columns: 1fr; gap: 3px; }} dd {{ margin-bottom: 8px; }} }}
   </style>
 </head>
-<body><main>
+<body>
+<main>
   <h1>C-Gate Server</h1>
-  <div class="sub">Manage the Schneider C-Gate runtime and C-Bus Toolkit project stored by this Home Assistant app.</div>
-  {notice}<div id="js-notice"></div>
+  <p class="lead">Manage the Schneider C-Gate runtime and C-Bus Toolkit project stored by this Home Assistant app.</p>
+  {notice}
 
   <section class="card">
     <h2>Status</h2>
-    <div class="row"><span class="label">C-Gate</span>{runtime_state}</div>
-    <div class="row"><span class="label">Runtime package</span>{package_state}</div>
-    <div class="row"><span class="label">Package file</span><span>{package_detail}</span></div>
-    <div class="row"><span class="label">Toolkit project</span>{project_state}</div>
-    <div class="row"><span class="label">Project details</span><span>{project_detail}</span></div>
-    {f'<div class="row"><span class="label">Build</span><span>{build}</span></div>' if build else ''}
+    <dl>
+      <dt>C-Gate</dt><dd>{html.escape(runtime_state)}</dd>
+      <dt>Runtime package</dt><dd>{html.escape(package_state)}</dd>
+      <dt>Package file</dt><dd>{package_detail}</dd>
+      <dt>Toolkit project</dt><dd>{html.escape(project_state)}</dd>
+      <dt>Project details</dt><dd>{project_detail}</dd>
+      {build_row}
+    </dl>
   </section>
 
   <section class="card">
-    <h2>Upload Toolkit project</h2>
+    <h2>Toolkit project</h2>
     <form id="project-form">
-      <input id="project-file" type="file" accept=".cbz,.db,.xml,application/zip,application/octet-stream,application/xml,text/xml" required>
-      <button id="project-button" type="submit">Upload project</button>
-      <div id="project-progress-wrap" class="progress-wrap"><progress id="project-progress" max="100" value="0"></progress><span id="project-progress-text" class="small">Preparing upload…</span></div>
-      <div class="small">Accepted: Toolkit <code>.cbz</code> backup, C-Gate 3 <code>.db</code> project, or legacy <code>.xml</code> project. Current Toolkit backups contain a SQLite database and are installed into C-Gate's <code>tag/&lt;PROJECT&gt;/&lt;PROJECT&gt;.db</code> repository on restart. Legacy XML may require conversion by C-Gate.</div>
+      <label for="project-file">Toolkit project file</label>
+      <input id="project-file" type="file" accept=".cbz,.db,.xml" required>
+      <p class="hint">Accepted: Toolkit <code>.cbz</code>, C-Gate 3 <code>.db</code>, or legacy <code>.xml</code>. Restart the app after uploading.</p>
+      <div id="project-progress" class="progress"></div>
+      <button id="project-submit" type="submit">Upload project</button>
     </form>
-    {project_delete}
+    {project_actions}
   </section>
 
   <section class="card">
-    <h2>Upload C-Gate package</h2>
+    <h2>C-Gate package</h2>
     <form id="package-form">
-      <input id="package-file" type="file" accept=".zip,application/zip" required>
-      <label class="check"><input id="accept-eula" type="checkbox" required><span>I obtained this package from Schneider Electric or an authorised source and accept the C-Gate licence agreement included in the package.</span></label>
-      <button id="package-button" type="submit">Upload package</button>
-      <div id="package-progress-wrap" class="progress-wrap"><progress id="package-progress" max="100" value="0"></progress><span id="package-progress-text" class="small">Preparing upload…</span></div>
-      <div class="small">Accepted: Schneider's outer Linux package or inner <code>cgate-*.zip</code>. Maximum size 256 MB. Files are split into 8 MB chunks to stay below the Home Assistant ingress request limit.</div>
+      <label for="package-file">Official C-Gate Linux ZIP</label>
+      <input id="package-file" type="file" accept=".zip" required>
+      <label class="check"><input id="package-eula" type="checkbox" required><span>I obtained this package from Schneider Electric or an authorised source and accept the licence included in it.</span></label>
+      <p class="hint">Maximum size 256 MB. Uploads are sent in 8 MB chunks for Home Assistant ingress compatibility.</p>
+      <div id="package-progress" class="progress"></div>
+      <button id="package-submit" type="submit">Upload package</button>
     </form>
-    {package_delete}
+    <div class="actions">{package_actions}</div>
   </section>
-
+</main>
 <script>
-(() => {{
-  const notice = document.getElementById('js-notice');
-  function showNotice(text, isError) {{
-    notice.className = 'notice ' + (isError ? 'error' : 'success');
-    notice.textContent = text;
-    notice.scrollIntoView({{behavior:'smooth', block:'nearest'}});
+const CHUNK_SIZE = {CHUNK_BYTES};
+
+async function jsonRequest(url, options) {{
+  const response = await fetch(url, options);
+  let payload = {{}};
+  try {{ payload = await response.json(); }} catch (_) {{}}
+  if (!response.ok || payload.error) {{
+    throw new Error(payload.error || `Request failed: ${{response.status}}`);
   }}
-  async function jsonRequest(url, options) {{
-    const response = await fetch(url, options);
-    let payload = {{}};
-    try {{ payload = await response.json(); }} catch (_) {{}}
-    if (!response.ok) throw new Error(payload.error || `Request failed (HTTP ${{response.status}})`);
-    return payload;
-  }}
-  function installUploader(kind, requireEula) {{
-    const form = document.getElementById(kind + '-form');
-    const input = document.getElementById(kind + '-file');
-    const button = document.getElementById(kind + '-button');
-    const wrap = document.getElementById(kind + '-progress-wrap');
-    const progress = document.getElementById(kind + '-progress');
-    const text = document.getElementById(kind + '-progress-text');
-    const eula = requireEula ? document.getElementById('accept-eula') : null;
-    form.addEventListener('submit', async (event) => {{
-      event.preventDefault();
-      const file = input.files[0];
-      if (!file || (eula && !eula.checked)) return;
-      button.disabled = true; input.disabled = true; if (eula) eula.disabled = true;
-      wrap.classList.add('active'); progress.value = 0; notice.className = ''; notice.textContent = '';
-      try {{
-        const request = {{filename:file.name, size:file.size}};
-        if (requireEula) request.accept_eula = true;
-        const start = await jsonRequest(`./${{kind}}/start`, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(request)}});
-        let offset = 0;
-        while (offset < file.size) {{
-          const end = Math.min(offset + start.chunk_size, file.size);
-          await jsonRequest(`./${{kind}}/chunk?id=${{encodeURIComponent(start.upload_id)}}&offset=${{offset}}`, {{method:'POST', headers:{{'Content-Type':'application/octet-stream'}}, body:file.slice(offset,end)}});
-          offset = end;
-          const percent = Math.round((offset / file.size) * 100);
-          progress.value = percent;
-          text.textContent = `Uploading… ${{percent}}% (${{(offset/1024/1024).toFixed(1)}} of ${{(file.size/1024/1024).toFixed(1)}} MB)`;
-        }}
-        text.textContent = kind === 'project' ? 'Validating Toolkit project…' : 'Validating C-Gate package…';
-        const finish = await jsonRequest(`./${{kind}}/finish`, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{upload_id:start.upload_id}})}});
-        progress.value = 100; text.textContent = 'Upload complete'; showNotice(finish.message || 'Upload complete.', false);
-        setTimeout(() => window.location.reload(), 1200);
-      }} catch (error) {{ text.textContent = 'Upload failed'; showNotice(error.message || String(error), true); }}
-      finally {{ button.disabled = false; input.disabled = false; if (eula) eula.disabled = false; }}
+  return payload;
+}}
+
+async function uploadFile(kind, file, acceptEula, progress) {{
+  progress.textContent = "Preparing upload…";
+  const start = await jsonRequest(`./${{kind}}/start`, {{
+    method: "POST",
+    headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{filename: file.name, size: file.size, accept_eula: acceptEula}})
+  }});
+  const chunkSize = start.chunk_size || CHUNK_SIZE;
+  let offset = 0;
+  while (offset < file.size) {{
+    const chunk = file.slice(offset, Math.min(offset + chunkSize, file.size));
+    const response = await jsonRequest(`./${{kind}}/chunk?id=${{encodeURIComponent(start.upload_id)}}&offset=${{offset}}`, {{
+      method: "POST",
+      headers: {{"Content-Type": "application/octet-stream"}},
+      body: chunk
     }});
+    offset = response.received;
+    progress.textContent = `Uploading… ${{Math.round(offset / file.size * 100)}}%`;
   }}
-  installUploader('project', false);
-  installUploader('package', true);
-}})();
+  const finish = await jsonRequest(`./${{kind}}/finish`, {{
+    method: "POST",
+    headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{upload_id: start.upload_id}})
+  }});
+  progress.textContent = finish.message || "Upload complete";
+  setTimeout(() => location.reload(), 900);
+}}
+
+function setupUploader(kind) {{
+  const form = document.getElementById(`${{kind}}-form`);
+  const fileInput = document.getElementById(`${{kind}}-file`);
+  const progress = document.getElementById(`${{kind}}-progress`);
+  const button = document.getElementById(`${{kind}}-submit`);
+  form.addEventListener("submit", async event => {{
+    event.preventDefault();
+    const file = fileInput.files[0];
+    if (!file) return;
+    const acceptEula = kind !== "package" || document.getElementById("package-eula").checked;
+    button.disabled = true;
+    try {{
+      await uploadFile(kind, file, acceptEula, progress);
+    }} catch (error) {{
+      progress.textContent = error.message;
+      button.disabled = false;
+    }}
+  }});
+}}
+setupUploader("project");
+setupUploader("package");
 </script>
-</main></body></html>"""
+</body>
+</html>
+"""
     return page.encode("utf-8")
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CgateUpload/0.3"
+    server_version = "CgateUpload/0.4"
 
     def log_message(self, format_string: str, *args: object) -> None:
-        print(f"[upload-ui] {self.address_string()} - {format_string % args}", flush=True)
+        print(
+            f"[upload-ui] {self.address_string()} - {format_string % args}",
+            flush=True,
+        )
 
-    def _send_page(self, message: str = "", error: bool = False, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_page(
+        self,
+        message: str = "",
+        error: bool = False,
+        status: HTTPStatus = HTTPStatus.OK,
+    ) -> None:
         body = _render_page(message, error)
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -595,7 +793,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_json(self, payload: dict[str, object], status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_json(
+        self,
+        payload: dict[str, object],
+        status: HTTPStatus = HTTPStatus.OK,
+    ) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -605,7 +807,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json(self, limit: int = 64 * 1024) -> dict[str, object]:
+    def _read_json_request(self, limit: int = 64 * 1024) -> dict[str, object]:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as err:
@@ -621,6 +823,10 @@ class Handler(BaseHTTPRequestHandler):
         return value
 
     def do_GET(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path.rstrip("/")
+        if path.endswith("/project/backup"):
+            self._handle_project_backup()
+            return
         self._send_page()
 
     def do_POST(self) -> None:  # noqa: N802
@@ -634,7 +840,6 @@ class Handler(BaseHTTPRequestHandler):
             "/project/chunk": lambda: self._handle_chunk("project"),
             "/project/finish": lambda: self._handle_finish("project"),
             "/project/delete": self._handle_project_delete,
-            # Backward-compatible v0.1.4/v0.1.5 package endpoints.
             "/upload/start": lambda: self._handle_start("package"),
             "/upload/chunk": lambda: self._handle_chunk("package"),
             "/upload/finish": lambda: self._handle_finish("package"),
@@ -651,7 +856,9 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Invalid upload ID")
         return UPLOAD_DIR / f"{upload_id}.part", UPLOAD_DIR / f"{upload_id}.json"
 
-    def _load_upload_state(self, upload_id: str, expected_kind: str) -> tuple[Path, Path, dict[str, object]]:
+    def _load_upload_state(
+        self, upload_id: str, expected_kind: str
+    ) -> tuple[Path, Path, dict[str, object]]:
         part_path, state_path = self._upload_paths(upload_id)
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -663,9 +870,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_start(self, kind: str) -> None:
         try:
-            request = self._read_json()
+            request = self._read_json_request()
             filename = Path(str(request.get("filename", ""))).name
             size = int(request.get("size", 0))
+
             if kind == "package":
                 if request.get("accept_eula") is not True:
                     raise ValueError("You must accept the included C-Gate licence agreement")
@@ -674,17 +882,25 @@ class Handler(BaseHTTPRequestHandler):
                 maximum = MAX_PACKAGE_BYTES
             else:
                 if Path(filename).suffix.lower() not in {".cbz", ".db", ".xml"}:
-                    raise ValueError("Select a Toolkit .cbz, C-Gate .db, or legacy .xml project")
+                    raise ValueError(
+                        "Select a Toolkit .cbz, C-Gate .db, or legacy .xml project"
+                    )
                 maximum = MAX_PROJECT_BYTES
+
             if size <= 0 or size > maximum:
-                raise ValueError(f"Upload is empty or exceeds the {maximum // 1024 // 1024} MB limit")
+                raise ValueError(
+                    f"Upload is empty or exceeds the {maximum // 1024 // 1024} MB limit"
+                )
 
             UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
             upload_id = secrets.token_hex(16)
             part_path, state_path = self._upload_paths(upload_id)
             part_path.touch(exist_ok=False)
             state_path.write_text(
-                json.dumps({"kind": kind, "filename": filename, "expected_size": size}, indent=2),
+                json.dumps(
+                    {"kind": kind, "filename": filename, "expected_size": size},
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
             self._send_json({"upload_id": upload_id, "chunk_size": CHUNK_BYTES})
@@ -700,7 +916,10 @@ class Handler(BaseHTTPRequestHandler):
             expected_size = int(state.get("expected_size", 0))
             current_size = part_path.stat().st_size
             if offset != current_size:
-                raise ValueError(f"Unexpected chunk offset; expected {current_size}, received {offset}")
+                raise ValueError(
+                    f"Unexpected chunk offset; expected {current_size}, received {offset}"
+                )
+
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
             except ValueError as err:
@@ -718,6 +937,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Upload chunk ended unexpectedly")
                     destination.write(block)
                     remaining -= len(block)
+
             self._send_json({"received": part_path.stat().st_size})
         except (ValueError, OSError) as err:
             self._send_json({"error": str(err)}, HTTPStatus.BAD_REQUEST)
@@ -726,15 +946,17 @@ class Handler(BaseHTTPRequestHandler):
         part_path: Path | None = None
         state_path: Path | None = None
         try:
-            request = self._read_json()
+            request = self._read_json_request()
             upload_id = str(request.get("upload_id", ""))
             part_path, state_path, state = self._load_upload_state(upload_id, kind)
             expected_size = int(state.get("expected_size", 0))
             actual_size = part_path.stat().st_size
             if actual_size != expected_size:
-                raise ValueError(f"Upload is incomplete: received {actual_size} of {expected_size} bytes")
-            original_filename = str(state.get("filename", ""))
+                raise ValueError(
+                    f"Upload is incomplete: received {actual_size} of {expected_size} bytes"
+                )
 
+            original_filename = str(state.get("filename", ""))
             if kind == "package":
                 valid, validation_message = _zip_contains_cgate_path(part_path)
                 if not valid:
@@ -754,14 +976,39 @@ class Handler(BaseHTTPRequestHandler):
                 record = _store_project(part_path, original_filename)
                 part_path.unlink(missing_ok=True)
                 message = (
-                    f"Project {record['project_name']} uploaded with {record['network_count']} networks "
-                    f"as {record['project_format']}. Restart the app so C-Gate installs and loads it."
+                    f"Project {record['project_name']} uploaded with "
+                    f"{record['network_count']} networks as {record['project_format']}. "
+                    "Restart the app so C-Gate installs and loads it."
                 )
 
             state_path.unlink(missing_ok=True)
             self._send_json({"message": message})
         except (ValueError, OSError) as err:
             self._send_json({"error": str(err)}, HTTPStatus.BAD_REQUEST)
+
+    def _handle_project_backup(self) -> None:
+        try:
+            with _create_project_backup() as (archive_path, filename):
+                size = archive_path.stat().st_size
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header(
+                    "Content-Disposition", f'attachment; filename="{filename}"'
+                )
+                self.send_header("Content-Length", str(size))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                with archive_path.open("rb") as source:
+                    shutil.copyfileobj(source, self.wfile, length=1024 * 1024)
+        except ProjectBackupError as err:
+            self._send_page(str(err), True, HTTPStatus.BAD_REQUEST)
+        except OSError as err:
+            self._send_page(
+                f"Unable to send the project backup: {err}",
+                True,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def _handle_package_delete(self) -> None:
         PACKAGE_PATH.unlink(missing_ok=True)
@@ -771,16 +1018,22 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_project_delete(self) -> None:
         metadata = _read_json(PROJECT_METADATA_PATH)
         active = str(metadata.get("active_project", "") or "")
+
         if active and PROJECT_NAME_RE.fullmatch(active):
             projects = metadata.get("projects")
             record = projects.get(active, {}) if isinstance(projects, dict) else {}
-            stored_filename = str(record.get("stored_filename", "") or "") if isinstance(record, dict) else ""
-            if stored_filename:
+            stored_filename = (
+                str(record.get("stored_filename", "") or "")
+                if isinstance(record, dict)
+                else ""
+            )
+            if stored_filename and Path(stored_filename).name == stored_filename:
                 (PROJECT_DIR / stored_filename).unlink(missing_ok=True)
             (PROJECT_DIR / f"{active}.db").unlink(missing_ok=True)
             (PROJECT_DIR / f"{active}.xml").unlink(missing_ok=True)
             shutil.rmtree(CGATE_TAG_DIR / active, ignore_errors=True)
             (CGATE_LEGACY_PROJECTS_DIR / f"{active}.xml").unlink(missing_ok=True)
+
             if isinstance(projects, dict):
                 projects.pop(active, None)
                 remaining = sorted(projects)
@@ -789,6 +1042,12 @@ class Handler(BaseHTTPRequestHandler):
                 _atomic_write_json(PROJECT_METADATA_PATH, metadata)
             else:
                 PROJECT_METADATA_PATH.unlink(missing_ok=True)
+        else:
+            live_project = _single_live_project()
+            if live_project:
+                shutil.rmtree(CGATE_TAG_DIR / live_project, ignore_errors=True)
+            PROJECT_METADATA_PATH.unlink(missing_ok=True)
+
         self._send_page("Uploaded project removed. Restart the app to apply the change.")
 
 
